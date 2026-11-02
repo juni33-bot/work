@@ -1,0 +1,24 @@
+# Define suppressions to prevent reporting of selected violations
+# detected by Parasoft analysis.
+# Note: One suppression entry can affect more than one violation.
+#
+# Example:
+#
+# suppression-begin
+# file: file.ext               (required)
+# line: 12                     (optional)
+# rule-id: BD-PB-VOVR          (optional)
+# message: Avoid unused values (optional)
+# reason: Approved             (optional)
+# author: devel                (optional)
+# date: 2020-09-21             (optional)
+# suppression-end
+
+suppression-begin
+file: memoryarea.h
+line: 29
+rule-id: MISRAC2012-DIR_4_8-a
+message: Consider hiding the implementation of the structure 'aiwMemoryAreaImpl' in a translation unit 'binary.c'
+reason: The implementation of the structure 'aiwMemoryAreaImpl' cannot be hidden because its size is required for the implementation of one of the dereferenced struct.
+author: brendon.gadacsi
+suppression-end

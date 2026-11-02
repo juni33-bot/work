@@ -1,0 +1,3 @@
+/home/devuser/apache6-sr-linux_som_micro/applications/tflite_det_app/app_build/CMakeFiles/rebuild_cache.dir
+/home/devuser/apache6-sr-linux_som_micro/applications/tflite_det_app/app_build/CMakeFiles/edit_cache.dir
+/home/devuser/apache6-sr-linux_som_micro/applications/tflite_det_app/app_build/CMakeFiles/app_tflite_det.dir
