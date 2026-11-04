@@ -402,6 +402,7 @@ static void *run_cnn_program(struct cnn_config* config, unsigned char *planar_rg
 
     VERBOSE("tensor_count = %d\n", tensor_count);
     cnn_output.total_tensor_cnt = tensor_count;
+    cnn_output.time_stamp_us = time_stamp;
     for (aiw_u32_t i = 0; i < tensor_count; ++i)
     {
         // uint64_t s_time = nc_get_mono_us_time();

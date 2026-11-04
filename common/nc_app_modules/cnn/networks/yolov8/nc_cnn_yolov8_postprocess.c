@@ -227,7 +227,7 @@ void postprocess_yolov8_detections(unsigned int canvas_w, unsigned int canvas_h,
     static uint64_t elapsed_ms = 0;
     #endif
 
-    uint64_t time_stamp = 0;
+    uint64_t time_stamp = cnn_output->time_stamp_us;
     int buf_write_idx = 0;
     static pp_result_buf *pp_buf = NULL;
     static stCnnPostprocessingResults *yolov8_detect_results = NULL;

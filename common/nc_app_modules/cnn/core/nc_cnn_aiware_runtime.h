@@ -86,6 +86,7 @@ typedef struct cnn_output_info {
     aiwTensorInfo tinfo_in;
     aiwTensorInfo *tinfo;
     aiw_u64_t buffer_size;
+    uint64_t time_stamp_us; // input frame time (monotonic, us)
 } cnn_output_info;
 
 typedef struct cnn_config {

@@ -64,6 +64,7 @@
 #include "nc_cnn_communicator.h"
 #include "nc_cnn_worker_for_postprocess.h"
 #include "nc_neon.h"
+#include "nc_utils.h"
 #ifdef AIWARE_DEVICE_SUPPORTED
 #include "aiware/runtime/c/aiwaredevice.h"
 #endif
@@ -88,7 +89,7 @@
 ********************************************************************************
 */
 
-#define VIS0_MAX_CH         (4)
+#define VIS0_MAX_CH         (1)
 #define VIS1_MAX_CH         (0)
 #define VIDEO_MAX_CH        (VIS0_MAX_CH + VIS1_MAX_CH)
 
@@ -712,7 +713,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                     ((framecnt % 2 == 1) && (i == 1 || i == 3)))
 #endif
                 {
-                    uint64_t time_stamp_us = 0;
+                    uint64_t time_stamp_us = nc_get_mono_us_time();
                     networkOrder[i] = nc_get_cnn_networks_id();
                     unsigned char* rgbdata_for_cnn = (unsigned char *)malloc(npu_input_info.rgb_size);
 #ifdef USE_8MP_VI
@@ -946,6 +947,9 @@ int npu_init(st_npu_input_info *npu_input_info)
 #endif
 #ifdef SHOW_YOLOV8_DETECT
         net_id = NETWORK_YOLOV8_DET;
+#endif
+#ifdef SHOW_TRI_CHIMERA
+        net_id = NETWORK_TRI_CHIMERA;
 #endif
 #ifndef SHOW_PELEE_SEG
         if (nc_init_bytetrackers(CAP_FPS, i, net_id) != 0) {
