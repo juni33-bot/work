@@ -1,0 +1,7 @@
+#demo application binary
+npu_app/app_npu
+wayland_cam_app/app_wayland_cam
+wayland_egl_app/app_wayland_egl
+wayland_npu_app/app_wayland_npu
+vcodec_app/app_vcodec
+dsr_app/app_dsr
