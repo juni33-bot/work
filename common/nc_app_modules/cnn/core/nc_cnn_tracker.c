@@ -32,6 +32,8 @@
 
 // #define SHOW_BYTETRACK_TIMEMEASURE
 
+#define BYTETRACK_TRACK_BUFFER  (15)  /* -> 0.5 s lost-track tolerance */
+
 uint32_t tracked_out_bbox_cnt = 0;
 stObjInfo *tracked_objs_info_arr = NULL;
 
@@ -56,7 +58,10 @@ int nc_init_bytetrackers (int fps, int cam_ch, E_NETWORK_UID  net_id)
     }
 
     tracked_objs_info_arr = (stObjInfo *)malloc(sizeof(stObjInfo) * MAX_CNN_RESULT_CNT_OF_CLASS);
-    return nc_init_bytetracker(fps, fps/2, net_info->class_id, net_info->class_num, cam_ch);
+    /* ByteTrack: max_time_lost(frames) = fps/30 * track_buffer.
+     * Fixed track_buffer keeps lost-track tolerance at 0.5 s for any fps
+     * (30fps: 15 frames, LIGHT 15fps: 7 frames). Same as fps/2 at 30fps. */
+    return nc_init_bytetracker(fps, BYTETRACK_TRACK_BUFFER, net_info->class_id, net_info->class_num, cam_ch);
 }
 
 void nc_deInit_bytetrackers (int cam_ch)

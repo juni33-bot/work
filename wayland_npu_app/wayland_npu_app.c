@@ -72,6 +72,9 @@
 #ifdef USE_BYTETRACK
 #include "nc_cnn_tracker.h"
 #endif
+#include "nc_meas.h"
+#include "nc_run_mode.h"
+#include "nc_traj.h"
 
 #ifdef USE_8MP_VI
 #include "nc_dsr_helper.h"
@@ -157,6 +160,99 @@ unsigned char* image_data;
 static int running = 1;
 
 st_nc_v4l2_config v4l2_config[VIDEO_MAX_CH];
+
+#ifdef USE_FILE_INPUT
+#ifdef USE_8MP_VI
+#error "USE_FILE_INPUT does not support USE_8MP_VI"
+#endif
+/*
+ * File input mode: decode a video file with ffmpeg (popen) instead of the camera.
+ * ffmpeg outputs interleaved RGB24 at NPU input resolution, paced at real time (-re),
+ * looping forever (-stream_loop -1).
+ * The pipe fd is stored in video_fd so that existing "video_fd != -1" checks keep working.
+ */
+#define FILE_INPUT_FFMPEG_PATH      "misc/ffmpeg"
+#define FILE_INPUT_DEFAULT_VIDEO    "misc/image_npu/1920_1080_0001.mp4"
+#define FILE_INPUT_FRAME_SIZE       (NPU_INPUT_WIDTH * NPU_INPUT_HEIGHT * 3)
+
+static const char *g_file_input_path = NULL;    // set by "-i <file>", NULL -> default
+static FILE *g_file_input_fp[VIDEO_MAX_CH];
+static unsigned char *g_file_input_frame[VIDEO_MAX_CH];   // interleaved RGB24
+
+static int file_input_initialize(void)
+{
+    char ffmpeg_path[256];
+    char video_path[256];
+    char cmd[1024];
+
+    snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", nc_localize_path(FILE_INPUT_FFMPEG_PATH));
+    if (g_file_input_path) {
+        snprintf(video_path, sizeof(video_path), "%s", g_file_input_path);
+    } else {
+        snprintf(video_path, sizeof(video_path), "%s", nc_localize_path(FILE_INPUT_DEFAULT_VIDEO));
+    }
+
+    if (access(video_path, R_OK) != 0) {
+        printf("[error] input video file not found: %s\n", video_path);
+        return -1;
+    }
+
+    snprintf(cmd, sizeof(cmd),
+             "%s -loglevel error -nostdin -stream_loop -1 -re -i \"%s\" "
+             "-vf scale=%d:%d -pix_fmt rgb24 -f rawvideo -",
+             ffmpeg_path, video_path, NPU_INPUT_WIDTH, NPU_INPUT_HEIGHT);
+
+    for (int i = 0; i < VIDEO_MAX_CH; i++) {
+        g_file_input_frame[i] = (unsigned char *)malloc(FILE_INPUT_FRAME_SIZE);
+        if (g_file_input_frame[i] == NULL) {
+            printf("[error] file input frame buffer alloc failure!\n");
+            return -1;
+        }
+
+        printf("[file input] ch%d : %s\n", i, cmd);
+        g_file_input_fp[i] = popen(cmd, "r");
+        if (g_file_input_fp[i] == NULL) {
+            perror("[error] popen(ffmpeg) failure");
+            return -1;
+        }
+        v4l2_config[i].video_buf.video_fd = fileno(g_file_input_fp[i]);
+    }
+
+    return 0;
+}
+
+// read one full frame (blocking). returns 0 on success, -1 on EOF/error
+static int file_input_read_frame(int ch)
+{
+    size_t total = 0;
+
+    while (total < FILE_INPUT_FRAME_SIZE) {
+        size_t n = fread(g_file_input_frame[ch] + total, 1, FILE_INPUT_FRAME_SIZE - total, g_file_input_fp[ch]);
+        if (n == 0) {
+            printf("[error] ffmpeg stream ended (ch%d). check ffmpeg / video file\n", ch);
+            v4l2_config[ch].video_buf.video_fd = -1;    // fall back to logo image
+            return -1;
+        }
+        total += n;
+    }
+
+    return 0;
+}
+
+static void file_input_deinitialize(void)
+{
+    for (int i = 0; i < VIDEO_MAX_CH; i++) {
+        if (g_file_input_fp[i]) {
+            pclose(g_file_input_fp[i]);
+            g_file_input_fp[i] = NULL;
+        }
+        if (g_file_input_frame[i]) {
+            free(g_file_input_frame[i]);
+            g_file_input_frame[i] = NULL;
+        }
+    }
+}
+#endif /* USE_FILE_INPUT */
 
 struct viewport g_viewport[VIDEO_MAX_CH];
 
@@ -375,6 +471,9 @@ int receive_cnn_buf (stCnnData **out_cnn_buf)
 
 int v4l2_initialize(void)
 {
+#ifdef USE_FILE_INPUT
+    return file_input_initialize();
+#endif
     for(int i = 0; i < VIDEO_MAX_CH; i++)
     {
         v4l2_config[i].video_buf.video_fd = nc_v4l2_open(v4l2_config[i].video_buf.video_device_num, true);
@@ -392,6 +491,10 @@ int v4l2_initialize(void)
 
     return 0;
 }
+
+// capture timestamp (monotonic us) of the video frame currently displayed per channel.
+// Written and read only in the render thread.
+static uint64_t g_disp_frame_ts_us[VIDEO_MAX_CH];
 
 void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *net_result, struct gl_npu_program g_npu_prog)
 {
@@ -426,6 +529,15 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
         for(int i=0; i<draw_cnn->max_class_cnt; i++){
             for(int bidx = 0; bidx < det_result->class_objs[i].obj_cnt; bidx++) {
                 stObjInfo obj_info = det_result->class_objs[i].objs[bidx];
+                // predicted box if available (vehicle, enough history), else measured box.
+                // Only the drawn copy changes; det_result / tracker input stay measured.
+                if (net_result->cam_channel < VIDEO_MAX_CH) {
+                    stBBox pred_box;
+                    if (nc_traj_get_predicted_box((int)net_result->cam_channel, i, obj_info.track_id,
+                                                  g_disp_frame_ts_us[net_result->cam_channel], &pred_box)) {
+                        obj_info.bbox = pred_box;
+                    }
+                }
                 nc_opengl_draw_rectangle(obj_info.bbox.x, obj_info.bbox.y, obj_info.bbox.w, obj_info.bbox.h, color[i], g_npu_prog);
 
                 // draw bbox label
@@ -700,6 +812,36 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
 
         }else
         {
+#ifdef USE_FILE_INPUT
+            // file input: read one interleaved RGB24 frame from ffmpeg
+            if (file_input_read_frame(i) == 0)
+            {
+                // capture time of the frame shown this render (also NPU input ts)
+                uint64_t frame_ts_us = nc_get_mono_us_time();
+                g_disp_frame_ts_us[i] = frame_ts_us;
+
+                // LIGHT mode: send every 2nd frame to NPU
+                if (nc_run_mode_should_send((uint32_t)i))
+                {
+                uint64_t time_stamp_us = frame_ts_us;
+                networkOrder[i] = nc_get_cnn_networks_id();
+                unsigned char* rgbdata_for_cnn = (unsigned char *)malloc(npu_input_info.rgb_size);
+                nc_rgb_interleaved_to_planar_neon(g_file_input_frame[i] \
+                                                ,(unsigned char *)rgbdata_for_cnn \
+                                                ,(unsigned char *)rgbdata_for_cnn + NPU_INPUT_DATA_SIZE \
+                                                ,(unsigned char *)rgbdata_for_cnn + NPU_INPUT_DATA_SIZE*2 \
+                                                , NPU_INPUT_WIDTH, NPU_INPUT_HEIGHT);
+                send_cnn_buf (rgbdata_for_cnn, time_stamp_us, (uint32_t)i, (E_NETWORK_UID)networkOrder[i]);
+                }
+
+                // Upload texture from file frame
+                glBindTexture(GL_TEXTURE_2D, window->gl.texture[i]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, VIDEO_WIDTH, VIDEO_HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, g_file_input_frame[i]);
+        #ifdef SHOW_FPS
+                printf(" -- fps(%0.1f)\n", calc_fps_at_loop_ent1(20));
+        #endif
+            }
+#else
             struct v4l2_buffer video_buf;
             CLEAR(video_buf);
 
@@ -708,12 +850,17 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 //printf("Error VIDIOC_DQBUF buffer %d\n", video_buf.index);
             }else
             {
+                // capture(DQBUF) time of the frame shown this render (also NPU input ts)
+                uint64_t frame_ts_us = nc_get_mono_us_time();
+                g_disp_frame_ts_us[i] = frame_ts_us;
 #if (VIDEO_MAX_CH == 4)
                 if (((framecnt % 2 == 0) && (i == 0 || i == 2)) ||
                     ((framecnt % 2 == 1) && (i == 1 || i == 3)))
 #endif
+                // LIGHT mode: send every 2nd eligible frame to NPU
+                if (nc_run_mode_should_send((uint32_t)i))
                 {
-                    uint64_t time_stamp_us = nc_get_mono_us_time();
+                    uint64_t time_stamp_us = frame_ts_us;
                     networkOrder[i] = nc_get_cnn_networks_id();
                     unsigned char* rgbdata_for_cnn = (unsigned char *)malloc(npu_input_info.rgb_size);
 #ifdef USE_8MP_VI
@@ -758,6 +905,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 printf(" -- fps(%0.1f)\n", calc_fps_at_loop_ent1(20));
         #endif
             }
+#endif /* USE_FILE_INPUT */
         }
 
         // draw video texture
@@ -782,7 +930,11 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             pp_result_buf *det_buf = NULL;
             det_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+DETECT_NETWORK, &time_stamp);
             if (det_buf) {
+                // predict tracks to the capture time of the displayed video frame
+                // (one short lock per frame), then draw. Runs before swap.
+                nc_traj_predict_frame((int)ch, g_disp_frame_ts_us[ch]);
                 nc_draw_gl_npu(g_viewport[ch], det_buf->net_task, det_buf, g_npu_prog);
+                nc_meas_on_display(ch, time_stamp);
             }
             nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
         #endif
@@ -952,7 +1104,8 @@ int npu_init(st_npu_input_info *npu_input_info)
         net_id = NETWORK_TRI_CHIMERA;
 #endif
 #ifndef SHOW_PELEE_SEG
-        if (nc_init_bytetrackers(CAP_FPS, i, net_id) != 0) {
+        // tracker runs at the per-channel NPU result rate (LIGHT: CAP_FPS/2)
+        if (nc_init_bytetrackers(CAP_FPS / nc_run_mode_npu_div(), i, net_id) != 0) {
             perror("nc_init_bytetrackers() error");
             return -1;
         }
@@ -976,6 +1129,10 @@ static void usage(int error_code)
     fprintf(stderr, "Usage: simple-egl [OPTIONS]\n\n"
         "  -f\tRun in fullscreen mode\n"
         "  -o\tCreate an opaque surface\n"
+        "  -l\tLIGHT mode: send every 2nd frame to NPU\n"
+#ifdef USE_FILE_INPUT
+        "  -i <file>\tInput video file (default: " FILE_INPUT_DEFAULT_VIDEO ")\n"
+#endif
         "  -h\tThis help text\n\n");
 
     exit(error_code);
@@ -1019,6 +1176,12 @@ int main(int argc, char **argv)
             window.opaque = 1;
         else if (strcmp("-h", argv[i]) == 0)
             usage(EXIT_SUCCESS);
+        else if (strcmp("-l", argv[i]) == 0)
+            nc_run_mode_set(NC_RUN_MODE_LIGHT);
+#ifdef USE_FILE_INPUT
+        else if (strcmp("-i", argv[i]) == 0 && i + 1 < argc)
+            g_file_input_path = argv[++i];
+#endif
         else
             usage(EXIT_FAILURE);
     }
@@ -1138,6 +1301,9 @@ int main(int argc, char **argv)
 
 #ifdef USE_8MP_VI
     dsr_deinit();
+#endif
+#ifdef USE_FILE_INPUT
+    file_input_deinitialize();
 #endif
     nc_wayland_display_destroy(&display);
 

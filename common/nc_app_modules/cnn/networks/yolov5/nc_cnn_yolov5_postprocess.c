@@ -42,6 +42,8 @@
 #include "nc_ts_fsync_flipflop_buffers.h"
 #ifdef USE_BYTETRACK
 #include "nc_cnn_tracker.h"
+#include "nc_meas.h"
+#include "nc_traj.h"
 #endif
 
 // #define SHOW_NMS_TIMEMEASURE
@@ -203,6 +205,8 @@ static void nc_postprocess_yolov5_detections(unsigned int target_w, unsigned int
 #ifdef USE_BYTETRACK
         // Execute tracker
         nc_cnn_track(out_cnn_results, cnn_output->net_id, cnn_output->cam_ch);
+        // trajectory: measurement update only (prediction is done in render loop)
+        nc_traj_update((int)cnn_output->cam_ch, cnn_output->net_id, out_cnn_results, cnn_output->time_stamp_us);
 #endif
         framecnt++;
     }
@@ -223,7 +227,7 @@ void postprocess_yolov5_detections(unsigned int canvas_w, unsigned int canvas_h,
     static uint64_t elapsed_ms = 0;
     #endif
 
-    uint64_t time_stamp = 0;
+    uint64_t time_stamp = cnn_output->time_stamp_us;
     int buf_write_idx = 0;
     static pp_result_buf *pp_buf = NULL;
     static stCnnPostprocessingResults *yolov5_detect_results = NULL;
@@ -245,6 +249,7 @@ void postprocess_yolov5_detections(unsigned int canvas_w, unsigned int canvas_h,
         pp_buf->net_task = DETECTION;
 
         nc_tsfs_ff_finish_write_buf(cnn_output->cam_ch+DETECT_NETWORK);
+        nc_meas_on_pipeline_done(cnn_output->cam_ch, time_stamp);
     }
 
     #ifdef PRINT_AVERAGE_PROCESS_TIME

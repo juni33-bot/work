@@ -53,6 +53,8 @@ endif
 # USE_8MP_VI          = yes
  USE_BYTETRACK       = yes
 # USE_ADAS_LD         = yes
+# 카메라 대신 동영상 파일(ffmpeg 디코딩)을 입력으로 사용. 카메라로 돌리려면 주석 처리
+USE_FILE_INPUT      = yes
 
 ARCH                ?= arm64
 # ARCH                ?= arm
@@ -255,6 +257,10 @@ ifeq ($(USE_ADAS_LD), yes)
 CFLAGS_TEST     += -DUSE_ADAS_LD
 endif
 
+ifeq ($(USE_FILE_INPUT), yes)
+CFLAGS_TEST         += -DUSE_FILE_INPUT
+endif
+
 # add link library
 LIBRARY             += $(AIWARE_LIB_DIR)/lib_$(ARCH)/libaiware-runtime-selftestdata.a
 LIBRARY             += $(AIWARE_LIB_DIR)/lib_$(ARCH)/libaiware-runtime-device-lib-c.a
@@ -329,6 +335,9 @@ CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_shader.c
 CSRCS              += $(NC_NEON_DIR)/nc_neon.c
 
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_traj.c
+CSRCS               += $(NC_CNN_CORE_DIR)/nc_meas.c
+CSRCS               += $(NC_CNN_CORE_DIR)/nc_model.c
+CSRCS               += $(NC_CNN_CORE_DIR)/nc_run_mode.c
 
 ifeq ($(USE_BYTETRACK), yes)
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_cnn_tracker.c
