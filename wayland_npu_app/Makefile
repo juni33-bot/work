@@ -51,7 +51,7 @@ USE_UFLD_TRACKING = yes
 endif
 
 # USE_8MP_VI          = yes
-# USE_BYTETRACK       = yes
+ USE_BYTETRACK       = yes
 # USE_ADAS_LD         = yes
 
 ARCH                ?= arm64
@@ -327,6 +327,8 @@ CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_ttf_font.c
 CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_init.c
 CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_shader.c
 CSRCS              += $(NC_NEON_DIR)/nc_neon.c
+
+CSRCS               += $(NC_CNN_CORE_DIR)/nc_traj.c
 
 ifeq ($(USE_BYTETRACK), yes)
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_cnn_tracker.c
