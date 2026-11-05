@@ -53,6 +53,8 @@ endif
 # USE_8MP_VI          = yes
  USE_BYTETRACK       = yes
 # USE_ADAS_LD         = yes
+# lane departure warning (needs the UFLD lane network)
+USE_LDW             = yes
 # 카메라 대신 동영상 파일(ffmpeg 디코딩)을 입력으로 사용. 카메라로 돌리려면 주석 처리
 USE_FILE_INPUT      = yes
 
@@ -150,6 +152,10 @@ endif
 
 ifeq ($(USE_ADAS_LD), yes)
 INC_DIR             += -I$(NC_APP_MODULES)/adas/ADAS_LD_Lib
+endif
+
+ifeq ($(USE_LDW)$(USE_CNN_UFLD_NETWORK), yesyes)
+INC_DIR             += -I$(NC_APP_MODULES)/ldw
 endif
 #############################################################
 
@@ -257,6 +263,10 @@ ifeq ($(USE_ADAS_LD), yes)
 CFLAGS_TEST     += -DUSE_ADAS_LD
 endif
 
+ifeq ($(USE_LDW)$(USE_CNN_UFLD_NETWORK), yesyes)
+CFLAGS_TEST         += -DUSE_LDW
+endif
+
 ifeq ($(USE_FILE_INPUT), yes)
 CFLAGS_TEST         += -DUSE_FILE_INPUT
 endif
@@ -334,8 +344,13 @@ CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_init.c
 CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_shader.c
 CSRCS              += $(NC_NEON_DIR)/nc_neon.c
 
+ifeq ($(USE_LDW)$(USE_CNN_UFLD_NETWORK), yesyes)
+CSRCS               += $(NC_APP_MODULES)/ldw/nc_ldw.c
+endif
+
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_traj.c
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_class.c
+CSRCS               += $(NC_CNN_CORE_DIR)/nc_cutin.c
 
 ifeq ($(USE_BYTETRACK), yes)
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_cnn_tracker.c

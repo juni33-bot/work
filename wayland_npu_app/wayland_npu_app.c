@@ -73,6 +73,10 @@
 #include "nc_cnn_tracker.h"
 #endif
 #include "nc_traj.h"
+#include "nc_cutin.h"
+#ifdef USE_LDW
+#include "nc_ldw.h"
+#endif
 
 #ifdef USE_8MP_VI
 #include "nc_dsr_helper.h"
@@ -497,6 +501,9 @@ static uint64_t g_disp_frame_ts_us[VIDEO_MAX_CH];
 // prediction line shorter than this (screen px) is not drawn
 #define PRED_LINE_MIN_PX    (15.0f)
 
+// cut-in warning box / text color (yellow: car class is already red)
+static float g_cutin_color[4] = {1.0f, 0.9f, 0.0f, 1.0f};
+
 void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *net_result, struct gl_npu_program g_npu_prog)
 {
     stCnnPostprocessingResults *det_result = &net_result->cnn_result;
@@ -527,6 +534,10 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
             color[j][RGBA_A] = 1.0f;
         }
 
+        // cut-in judgement runs once per displayed frame of this channel
+        int cut_ch = (net_result->cam_channel < VIDEO_MAX_CH) ? (int)net_result->cam_channel : -1;
+        if (cut_ch >= 0) nc_cutin_begin_frame(cut_ch, g_disp_frame_ts_us[cut_ch]);
+
         for(int i=0; i<draw_cnn->max_class_cnt; i++){
             for(int bidx = 0; bidx < det_result->class_objs[i].obj_cnt; bidx++) {
                 stObjInfo obj_info = det_result->class_objs[i].objs[bidx];
@@ -546,7 +557,19 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                                                                &fut_cx, &fut_cy);
                     }
                 }
-                nc_opengl_draw_rectangle(obj_info.bbox.x, obj_info.bbox.y, obj_info.bbox.w, obj_info.bbox.h, color[i], g_npu_prog);
+                // cut-in: future bottom-center enters the ego lane (lane coordinates)
+                int is_cutin = 0;
+                if (has_future) {
+                    is_cutin = nc_cutin_eval(cut_ch, i, obj_info.track_id, &obj_info.bbox,
+                                             fut_cx, fut_cy, g_disp_frame_ts_us[cut_ch]);
+                }
+                float *dcolor = is_cutin ? g_cutin_color : color[i];
+
+                nc_opengl_draw_rectangle(obj_info.bbox.x, obj_info.bbox.y, obj_info.bbox.w, obj_info.bbox.h, dcolor, g_npu_prog);
+                if (is_cutin) { // thicker box
+                    nc_opengl_draw_rectangle(obj_info.bbox.x + 3.f, obj_info.bbox.y + 3.f,
+                                             obj_info.bbox.w - 6.f, obj_info.bbox.h - 6.f, dcolor, g_npu_prog);
+                }
 
                 // prediction line: current (predicted-now) center -> center after FUTURE_MS, dashed
                 // Hidden when shorter than PRED_LINE_MIN_PX: cars followed at similar speed barely
@@ -555,8 +578,8 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                 float cur_cy = obj_info.bbox.y + obj_info.bbox.h * 0.5f;
                 float ldx = fut_cx - cur_cx, ldy = fut_cy - cur_cy;
                 if (has_future && (ldx * ldx + ldy * ldy) >= PRED_LINE_MIN_PX * PRED_LINE_MIN_PX) {
-                    nc_opengl_draw_line(cur_cx, cur_cy, fut_cx, fut_cy, 2 /* dashed */, color[i], g_npu_prog);
-                    nc_opengl_draw_rectangle(fut_cx - 4.f, fut_cy - 4.f, 8.f, 8.f, color[i], g_npu_prog); // end marker
+                    nc_opengl_draw_line(cur_cx, cur_cy, fut_cx, fut_cy, 2 /* dashed */, dcolor, g_npu_prog);
+                    nc_opengl_draw_rectangle(fut_cx - 4.f, fut_cy - 4.f, 8.f, 8.f, dcolor, g_npu_prog); // end marker
                 }
 
                 // draw bbox label
@@ -567,8 +590,20 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
 #else
                 sprintf(buftext, "%s:%0.2f", draw_cnn->class_names[i], obj_info.prob);
 #endif
-                float textcolor[3] = {color[i][RGBA_R], color[i][RGBA_G], color[i][RGBA_B]};
+                if (is_cutin) sprintf(buftext, "[%d]CUT-IN", obj_info.track_id);
+                float textcolor[3] = {dcolor[RGBA_R], dcolor[RGBA_G], dcolor[RGBA_B]};
                 nc_opengl_draw_text(&font_24, buftext, obj_info.bbox.x, (float)WINDOW_HEIGHT - (obj_info.bbox.y-12), target_view_ratio, textcolor, WINDOW_WIDTH, WINDOW_HEIGHT, g_font_prog);
+            }
+        }
+
+        if (cut_ch >= 0) {
+            if (nc_cutin_end_frame(cut_ch)) {
+                // TODO(merge): nc_rec_trigger(1) -- cut-in warning just turned ON (edge only)
+            }
+            if (nc_cutin_active_count(cut_ch) > 0) {
+                float wcolor[3] = {g_cutin_color[RGBA_R], g_cutin_color[RGBA_G], g_cutin_color[RGBA_B]};
+                nc_opengl_draw_text(&font_38, "CUT-IN WARNING", (float)WINDOW_WIDTH * 0.5f - 160.f, 1020.f,
+                                    target_view_ratio, wcolor, WINDOW_WIDTH, WINDOW_HEIGHT, g_font_prog);
             }
         }
 
@@ -970,7 +1005,16 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (lane_buf) {
                 nc_draw_gl_npu(g_viewport[ch], lane_buf->net_task, lane_buf, g_npu_prog);
             }
+        #ifdef USE_LDW
+            nc_ldw_app_process(ch, lane_buf);          // inside the buffer lock (before finish_read)
+        #endif
             nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
+        #ifdef USE_LDW
+            {
+                stNcLdwDrawRes ldw_res = { &font_24, &font_38, &g_font_prog, &g_npu_prog };
+                nc_ldw_app_draw(ch, g_viewport[ch], &ldw_res);
+            }
+        #endif
         #endif
         }
     }
@@ -1217,6 +1261,9 @@ int main(int argc, char **argv)
     window.window_size.height = WINDOW_HEIGHT;
 
     set_viewport_config();
+#ifdef USE_LDW
+    nc_ldw_app_init(VIDEO_MAX_CH, (float)WINDOW_WIDTH, (float)WINDOW_HEIGHT);
+#endif
 
     nc_wayland_display_init(&display,(void *)render);
 
