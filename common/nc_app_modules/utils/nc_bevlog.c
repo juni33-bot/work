@@ -15,14 +15,13 @@ static const char *const k_header[NC_BEVLOG_NUM] = {
     "t_disp_us,t_det_us,t_lane_us,ch,track_id,class,"
     "meas_x,meas_y,meas_w,meas_h,pred_valid,pred_x,pred_y,pred_w,pred_h,"
     "u_used,v_used,vp_cal,k_cal,x_raw_m,z_raw_m,x_shown_m,z_shown_m,shown,"
-    "vp_used,geom_same_frame,mm_id,disp_class,x_old_raw_m,z_old_raw_m,"
-    "z_ground_m,z_width_m,w_scale,z_fused_m",
+    "vp_used,geom_same_frame,mm_id,disp_class",
     /* det: raw detection before the tracker (worker thread) */
     "t_det_us,ch,class,x,y,w,h,prob",
     /* lane: new lane result (render thread, LDW) */
     "t_now_us,t_lane_us,ch,left_ok,right_ok,aL,bL,aR,bR,k_inst,vp_inst,k_cal,vp_cal,"
     "state,dist_l_m,dist_r_m,lat_vel_mps,tlc_s,tlc_thresh_s,cnt_l,cnt_r,warn_until_us,latency_ms,"
-    "pitch_measured,vp_meas,vp_pitch,pitch_from_raw,vp_lane,class0,class1,class2,class3",
+    "class0,class1,class2,class3",
     /* frame: render timing */
     "t_us,gl_ms,frame_ms"
 };

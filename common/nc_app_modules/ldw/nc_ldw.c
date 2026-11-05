@@ -36,13 +36,6 @@ const stNcLdwEgoLane NC_LDW_EGO_LANE = {
 #define LDW_VEL_ALPHA               (0.30f)   // EMA weight for lateral velocity
 #define LDW_MAX_DT_S                (1.0f)
 
-/* Per-frame horizon (pitch). k does not change with pitch (a vertical image
- * shift only moves the vanishing row), so with the calibrated k the lane width
- * on one row gives this frame's vanishing row: vp = y - w(y) / k. */
-#define LDW_PITCH_ALPHA             (0.6f)    // EMA weight per lane frame (light: pitch must be followed)
-#define LDW_PITCH_GATE_PX           (12.0f)   // larger jump from the filtered value = outlier
-#define LDW_PITCH_RESET_CNT         (4)       // consecutive outliers -> accept the new level
-#define LDW_PITCH_MAX_DEV_PX        (40.0f)   // sanity range around the calibrated row
 
 static float us_to_s(uint64_t us)
 {
@@ -155,8 +148,6 @@ void nc_ldw_set_turn_signal(stNcLdwContext *ctx, int left_on, int right_on)
 
 static void ldw_reset_tracking(stNcLdwContext *ctx)
 {
-    ctx->pitch_valid = 0;
-    ctx->lane_vp_valid = 0;
     ctx->has_last = 0;
     ctx->left_cnt = 0;
     ctx->right_cnt = 0;
@@ -205,78 +196,6 @@ static void ldw_update_calibration(stNcLdwContext *ctx, float aL, float bL, floa
     }
 }
 
-/* vanishing row from two lines with the calibrated k: vp = y - w(y) / k,
- * evaluated in the middle of the fitted rows where the lines are best measured */
-static float ldw_vp_from_width(const stNcLdwContext *ctx, float aL, float bL, float aR, float bR)
-{
-    const stNcLdwConfig *c = &ctx->cfg;
-    float y_m = 0.5f * (c->fit_y_min_px + c->img_h);
-    float w_m = (aR - aL) * y_m + (bR - bL);
-    return y_m - w_m / ctx->calib_k;
-}
-
-/* Measure this frame's vanishing row from both fitted lines and filter it. */
-static void ldw_update_pitch(stNcLdwContext *ctx, int both_ok, float aL, float bL, float aR, float bR)
-{
-    stNcLdwResult *r = &ctx->res;
-
-    r->pitch_measured = 0;
-    if (!ctx->calib_valid) { ctx->pitch_valid = 0; return; }
-
-    if (both_ok) {
-        float vp = ldw_vp_from_width(ctx, aL, bL, aR, bR);
-
-        if (fabsf(vp - ctx->calib_vp_y) <= LDW_PITCH_MAX_DEV_PX) {
-            r->pitch_measured = 1;
-            r->vp_meas_px = vp;
-            if (!ctx->pitch_valid) {
-                ctx->pitch_vp_y = vp;
-                ctx->pitch_valid = 1;
-                ctx->pitch_reject_cnt = 0;
-            } else if (fabsf(vp - ctx->pitch_vp_y) > LDW_PITCH_GATE_PX &&
-                       ++ctx->pitch_reject_cnt < LDW_PITCH_RESET_CNT) {
-                /* outlier: keep the filtered value */
-            } else {
-                if (ctx->pitch_reject_cnt >= LDW_PITCH_RESET_CNT) ctx->pitch_vp_y = vp;   // new level
-                else ctx->pitch_vp_y += LDW_PITCH_ALPHA * (vp - ctx->pitch_vp_y);
-                ctx->pitch_reject_cnt = 0;
-            }
-        }
-    }
-    if (!ctx->pitch_valid) {           // nothing measured yet: fall back to the calibration
-        ctx->pitch_vp_y = ctx->calib_vp_y;
-    }
-    r->vp_pitch_px = ctx->pitch_vp_y;
-}
-
-void nc_ldw_measure_horizon(stNcLdwContext *ctx, const stLaneDet *raw, int lane_num)
-{
-    const stNcLdwConfig *c = &ctx->cfg;
-    stNcLdwResult *r = &ctx->res;
-    float aL = 0.0f, bL = 0.0f, aR = 0.0f, bR = 0.0f;
-    int both = 0;
-    const int li = (int)NC_LDW_EGO_LANE.left_boundary_index;
-    const int ri = (int)NC_LDW_EGO_LANE.right_boundary_index;
-
-    if (raw != NULL) {
-        float max_rms = c->img_w * LDW_MAX_FIT_RMS_RATIO;
-        both = lane_num > li && lane_num > ri &&
-               fit_lane_line(&raw[li], c->fit_y_min_px, c->img_h, max_rms, &aL, &bL) == 0 &&
-               fit_lane_line(&raw[ri], c->fit_y_min_px, c->img_h, max_rms, &aR, &bR) == 0;
-        if (both) {
-            float w = (aR - aL) * c->ref_y_px + (bR - bL);
-            if (w < c->img_w * LDW_MIN_LANE_PX_RATIO || w > c->img_w * LDW_MAX_LANE_PX_RATIO) both = 0;
-        }
-        r->pitch_from_raw = 1;
-    } else {
-        /* fallback: lines of this update (time-averaged points: pitch is not followed) */
-        both = r->valid && r->left_detected && r->right_detected;
-        aL = r->left_a; bL = r->left_b; aR = r->right_a; bR = r->right_b;
-        r->pitch_from_raw = 0;
-    }
-    ldw_update_pitch(ctx, both, aL, bL, aR, bR);
-}
-
 int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
                   uint64_t data_time_us, uint64_t now_us)
 {
@@ -315,13 +234,6 @@ int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
         } else {
             ldw_update_calibration(ctx, aL, bL, aR, bR);
         }
-    }
-    /* horizon of the averaged points themselves (for drawing them) */
-    if (left_ok && right_ok && ctx->calib_valid) {
-        r->vp_lane_px = ldw_vp_from_width(ctx, aL, bL, aR, bR);
-        ctx->lane_vp_valid = 1;
-    } else if (!ctx->lane_vp_valid) {
-        r->vp_lane_px = ctx->calib_vp_y;
     }
 
     /* One line only: infer the other from the calibrated lane width
@@ -493,7 +405,6 @@ static int g_ldw_ch_num = 0;
 static float g_ldw_canvas_w = 0.0f;
 static float g_ldw_canvas_h = 0.0f;
 static int g_ldw_suspended[NC_LDW_MAX_CH];
-static uint64_t g_ldw_last_frame_us[NC_LDW_MAX_CH];   // capture time of the last lane frame processed
 
 /* Ego-lane snapshot shared with other threads (cut-in prediction). */
 typedef struct {
@@ -528,9 +439,7 @@ static void ldw_publish_geom(uint32_t ch, const stNcLdwContext *ctx, const pp_re
     stNcLdwGeom g;
     g.t_us = lane_buf->time_stamp;
     g.k = ctx->calib_k;
-    g.vp_y = ctx->pitch_valid ? ctx->pitch_vp_y : ctx->calib_vp_y;
-    g.vp_lane_y = ctx->lane_vp_valid ? ctx->res.vp_lane_px : ctx->calib_vp_y;
-    g.pitch_measured = ctx->res.pitch_measured;
+    g.vp_y = ctx->calib_vp_y;                 // calibrated (slow EMA) horizon
 
     int n = lane_buf->lane_draw_info.max_lane_num;
     if (n > MAX_LANE_DET_CNT) n = MAX_LANE_DET_CNT;
@@ -631,7 +540,6 @@ void nc_ldw_app_init(int ch_num, float canvas_w, float canvas_h)
     for (int i = 0; i < ch_num; i++) {
         nc_ldw_init(&g_ldw_ctx[i], &cfg);
         g_ldw_suspended[i] = 0;
-        g_ldw_last_frame_us[i] = 0;
     }
     /* constants needed to recompute road positions offline */
     nc_bevlog_row(NC_BEVLOG_LANE, "# cfg canvas_w=%.0f canvas_h=%.0f focal_px=%.3f lane_width_m=%.3f cam_x_px=%.2f "
@@ -681,16 +589,6 @@ void nc_ldw_app_process(uint32_t ch, const pp_result_buf *lane_buf)
         // time_stamp stays 0 until the input timestamp is passed through (then it is used)
         new_data = nc_ldw_update(ctx, lane_buf->cnn_result.lane_det, lane_buf->lane_draw_info.max_lane_num,
                                  lane_buf->time_stamp, now_us);
-        /* A new lane frame is decided by its capture time: the time-averaged
-         * points can repeat (same signature -> update skipped) while the raw
-         * points of the frame, and so the horizon, have changed. */
-        int new_frame = lane_buf->time_stamp != 0 ? lane_buf->time_stamp != g_ldw_last_frame_us[ch] : new_data;
-        if (new_frame) {
-            g_ldw_last_frame_us[ch] = lane_buf->time_stamp;
-            nc_ldw_measure_horizon(ctx, lane_buf->cnn_result.lane_raw_valid ? lane_buf->cnn_result.lane_det_raw : NULL,
-                                   lane_buf->lane_draw_info.max_lane_num);
-            new_data = 1;
-        }
     } else {
         new_data = nc_ldw_update(ctx, NULL, 0, 0, now_us);
     }
@@ -708,7 +606,7 @@ void nc_ldw_app_process(uint32_t ch, const pp_result_buf *lane_buf)
         float vp_inst = (both && k_inst > 1e-4f) ? (r->left_b - r->right_b) / k_inst : 0.0f;
         nc_bevlog_row(NC_BEVLOG_LANE,
                       "%llu,%llu,%u,%d,%d,%.5f,%.2f,%.5f,%.2f,%.5f,%.2f,%.5f,%.2f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%llu,%.1f,"
-                      "%d,%.2f,%.2f,%d,%.2f,%d,%d,%d,%d",
+                      "%d,%d,%d,%d",
                       (unsigned long long)now_us, (unsigned long long)(lane_buf ? lane_buf->time_stamp : 0), ch,
                       fresh ? r->left_detected : 0, fresh ? r->right_detected : 0,
                       (double)r->left_a, (double)r->left_b, (double)r->right_a, (double)r->right_b,
@@ -718,9 +616,6 @@ void nc_ldw_app_process(uint32_t ch, const pp_result_buf *lane_buf)
                       (double)r->lat_vel_mps, (double)r->tlc_s, (double)r->tlc_thresh_s,
                       ctx->left_cnt, ctx->right_cnt, (unsigned long long)ctx->warn_until_us,
                       (double)r->latency_ms,
-                      r->pitch_measured, (double)(r->pitch_measured ? r->vp_meas_px : 0.0f),
-                      (double)(ctx->pitch_valid ? ctx->pitch_vp_y : ctx->calib_vp_y),
-                      r->pitch_from_raw, (double)r->vp_lane_px,
                       ldw_lane_class(lane_buf, 0), ldw_lane_class(lane_buf, 1),
                       ldw_lane_class(lane_buf, 2), ldw_lane_class(lane_buf, 3));
     }

@@ -93,18 +93,6 @@ typedef struct {
     float vp_y_px;              // calibrated vanishing row
     float cam_height_m;         // estimated camera height (sanity check)
     float latency_ms;           // processing latency used for the warning decision
-
-    /* per-frame horizon (pitch): vanishing row measured from this frame's RAW
-     * lane points (before UFLD temporal averaging) and the calibrated k,
-     * gated and low-pass filtered. Used for vehicle positions. */
-    int   pitch_measured;       // 1: vp_meas_px measured on this frame (both raw lines)
-    int   pitch_from_raw;       // 1: raw points were available, 0: averaged points used
-    float vp_meas_px;           // raw measurement of this frame
-    float vp_pitch_px;          // filtered per-frame vanishing row
-
-    /* vanishing row of the (time-averaged) lane points themselves: used to draw
-     * those points, so that the drawn lanes keep their width */
-    float vp_lane_px;
 } stNcLdwResult;
 
 typedef struct {
@@ -116,11 +104,6 @@ typedef struct {
     float calib_k;
     float calib_vp_y;
 
-    // per-frame horizon (pitch) filter
-    int   pitch_valid;
-    float pitch_vp_y;
-    int   pitch_reject_cnt;
-    int   lane_vp_valid;
 
     // temporal state
     uint32_t last_sig;
@@ -150,11 +133,6 @@ int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
 /* Stop LDW while no lane results are available (e.g. model SKIP mode):
  * clears the warning and restarts velocity tracking. Calibration is kept. */
 void nc_ldw_suspend(stNcLdwContext *ctx);
-
-/* Per-frame horizon from the raw lane points of the frame just passed to
- * nc_ldw_update() (raw == NULL: use that update's fitted lines). Call right
- * after nc_ldw_update() returned 1. */
-void nc_ldw_measure_horizon(stNcLdwContext *ctx, const stLaneDet *raw, int lane_num);
 
 /* Suppress warnings on the side the driver is signalling. */
 void nc_ldw_set_turn_signal(stNcLdwContext *ctx, int left_on, int right_on);
@@ -210,8 +188,8 @@ int nc_ldw_get_ego_lane(uint32_t ch, float y, float *x_left, float *x_right, uin
 int nc_ldw_is_in_ego_lane(uint32_t ch, float x, float y);
 
 /*
- * Road geometry of one lane frame: w(y) = k * (y - vp_y), vp_y = per-frame
- * (pitch-filtered) vanishing row. Thread-safe.
+ * Road geometry of one lane frame: w(y) = k * (y - vp_y), vp_y = calibrated
+ * (slow EMA) vanishing row. Thread-safe.
  *
  * nc_ldw_app_get_geom(): geometry of the lane frame captured at t_us (closest
  *   one in the last 16 lane frames; t_us = 0: newest).
@@ -226,9 +204,7 @@ int nc_ldw_is_in_ego_lane(uint32_t ch, float x, float y);
 typedef struct {
     uint64_t t_us;
     float    k;
-    float    vp_y;              // per-frame horizon from raw lane points: for vehicles
-    float    vp_lane_y;         // horizon of the averaged lane points: for drawing those points
-    int      pitch_measured;    // 1: vp_y measured on this frame, 0: held from an earlier one
+    float    vp_y;
 } stNcLdwGeom;
 
 typedef struct {

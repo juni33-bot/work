@@ -1019,17 +1019,6 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
         else{
             uint64_t time_stamp = 0;
 
-        #if defined(LANE_NETWORK) && defined(USE_LDW)
-            // LDW first: the minimap looks up the horizon of each detection's own
-            // lane frame, so that frame must be processed before the boxes are drawn.
-            // (short read lock: the lane buffer is read again below for drawing)
-            {
-                pp_result_buf *ldw_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+LANE_NETWORK, &time_stamp);
-                nc_ldw_app_process(ch, ldw_buf);
-                nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
-            }
-        #endif
-
         #ifdef DETECT_NETWORK
             pp_result_buf *det_buf = NULL;
             det_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+DETECT_NETWORK, &time_stamp);
@@ -1057,6 +1046,9 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (lane_buf) {
                 nc_draw_gl_npu(g_viewport[ch], lane_buf->net_task, lane_buf, g_npu_prog);
             }
+        #ifdef USE_LDW
+            nc_ldw_app_process(ch, lane_buf);          // inside the buffer lock (before finish_read)
+        #endif
             nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
         #ifdef USE_LDW
             {
