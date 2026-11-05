@@ -687,6 +687,10 @@ static void nc_postprocess_ufld_detections(unsigned int target_w, unsigned int t
         case 6: // 6 class
             nc_ufld_decide_lane_class(cnn_output, out_cnn_results);
 
+            // keep this frame's points before tracking replaces them with a multi-frame average
+            memcpy(out_cnn_results->lane_det_raw, out_cnn_results->lane_det, sizeof(out_cnn_results->lane_det_raw));
+            out_cnn_results->lane_raw_valid = 1;
+
 #ifdef USE_UFLD_TRACKING
             // nc_ufld_tracking_v1(out_cnn_results);
             nc_ufld_tracking_v2(out_cnn_results, target_w);

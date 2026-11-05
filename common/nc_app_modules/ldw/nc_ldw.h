@@ -30,6 +30,11 @@ extern const stNcLdwEgoLane NC_LDW_EGO_LANE;
 
 #define NC_LDW_DEFAULT_LANE_WIDTH_M     (3.5f)
 
+/* Horizontal field of view used for the default focal length (dashcam ~100-120 deg).
+ * Only forward distance (z_m) depends on it; a wrong value scales all z_m by the
+ * same factor. Tune with dashed lane lines (highway: 10 m line + 10 m gap). */
+#define NC_LDW_DEFAULT_HFOV_DEG         (110.0f)
+
 typedef enum {
     NC_LDW_STATE_INVALID = 0,   // ego lane not available
     NC_LDW_STATE_NORMAL,        // inside the lane
@@ -88,6 +93,18 @@ typedef struct {
     float vp_y_px;              // calibrated vanishing row
     float cam_height_m;         // estimated camera height (sanity check)
     float latency_ms;           // processing latency used for the warning decision
+
+    /* per-frame horizon (pitch): vanishing row measured from this frame's RAW
+     * lane points (before UFLD temporal averaging) and the calibrated k,
+     * gated and low-pass filtered. Used for vehicle positions. */
+    int   pitch_measured;       // 1: vp_meas_px measured on this frame (both raw lines)
+    int   pitch_from_raw;       // 1: raw points were available, 0: averaged points used
+    float vp_meas_px;           // raw measurement of this frame
+    float vp_pitch_px;          // filtered per-frame vanishing row
+
+    /* vanishing row of the (time-averaged) lane points themselves: used to draw
+     * those points, so that the drawn lanes keep their width */
+    float vp_lane_px;
 } stNcLdwResult;
 
 typedef struct {
@@ -98,6 +115,12 @@ typedef struct {
     int   calib_valid;
     float calib_k;
     float calib_vp_y;
+
+    // per-frame horizon (pitch) filter
+    int   pitch_valid;
+    float pitch_vp_y;
+    int   pitch_reject_cnt;
+    int   lane_vp_valid;
 
     // temporal state
     uint32_t last_sig;
@@ -127,6 +150,11 @@ int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
 /* Stop LDW while no lane results are available (e.g. model SKIP mode):
  * clears the warning and restarts velocity tracking. Calibration is kept. */
 void nc_ldw_suspend(stNcLdwContext *ctx);
+
+/* Per-frame horizon from the raw lane points of the frame just passed to
+ * nc_ldw_update() (raw == NULL: use that update's fitted lines). Call right
+ * after nc_ldw_update() returned 1. */
+void nc_ldw_measure_horizon(stNcLdwContext *ctx, const stLaneDet *raw, int lane_num);
 
 /* Suppress warnings on the side the driver is signalling. */
 void nc_ldw_set_turn_signal(stNcLdwContext *ctx, int left_on, int right_on);
@@ -180,6 +208,55 @@ void nc_ldw_app_draw(uint32_t ch, struct viewport vp, const stNcLdwDrawRes *res)
  */
 int nc_ldw_get_ego_lane(uint32_t ch, float y, float *x_left, float *x_right, uint64_t *time_us);
 int nc_ldw_is_in_ego_lane(uint32_t ch, float x, float y);
+
+/*
+ * Road geometry of one lane frame: w(y) = k * (y - vp_y), vp_y = per-frame
+ * (pitch-filtered) vanishing row. Thread-safe.
+ *
+ * nc_ldw_app_get_geom(): geometry of the lane frame captured at t_us (closest
+ *   one in the last 16 lane frames; t_us = 0: newest).
+ *   Returns 0 = same frame, 1 = closest other frame, -1 = none (not calibrated).
+ * nc_ldw_geom_to_road(): road position of pixel (u, v) with that geometry.
+ *   x_m lateral from vehicle centre (+: right), z_m forward from the camera.
+ *   Returns -1 if v is at/above the horizon.
+ * nc_ldw_app_get_lanes(): copy of the newest lane points (canvas px, with the
+ *   network lane_class 0 none / 1 solid / 2 dashed) and their capture time.
+ *   Returns -1 if none.
+ */
+typedef struct {
+    uint64_t t_us;
+    float    k;
+    float    vp_y;              // per-frame horizon from raw lane points: for vehicles
+    float    vp_lane_y;         // horizon of the averaged lane points: for drawing those points
+    int      pitch_measured;    // 1: vp_y measured on this frame, 0: held from an earlier one
+} stNcLdwGeom;
+
+typedef struct {
+    uint64_t  t_us;
+    int       lane_num;
+    stLaneDet lane[MAX_LANE_DET_CNT];
+} stNcLdwLanes;
+
+int nc_ldw_app_get_geom(uint32_t ch, uint64_t t_us, stNcLdwGeom *g);
+int nc_ldw_geom_to_road(uint32_t ch, const stNcLdwGeom *g, float u, float v, float *x_m, float *z_m);
+int nc_ldw_app_get_lanes(uint32_t ch, stNcLdwLanes *out);
+
+/* focal length (canvas px) used for forward distances, 0 if not initialised */
+float nc_ldw_app_focal_px(uint32_t ch);
+
+/*
+ * Road-plane position of canvas pixel (u, v) with the newest lane frame geometry. Thread-safe.
+ * x_m: lateral distance from vehicle centre (+: right).
+ * z_m: forward distance from the camera (from NC_LDW_DEFAULT_HFOV_DEG).
+ * Either pointer may be NULL.
+ * Returns 0 on success, -1 if not calibrated yet or v is at/above the horizon.
+ * Works with the last calibration even while lanes are briefly lost.
+ */
+int nc_ldw_app_pixel_to_road(uint32_t ch, float u, float v, float *x_m, float *z_m);
+
+/* Calibration used by nc_ldw_app_pixel_to_road (diagnostics). Thread-safe.
+ * Returns 0 if calibrated, -1 otherwise. Any pointer may be NULL. */
+int nc_ldw_app_get_calib(uint32_t ch, float *k, float *vp_y, uint64_t *lane_time_us);
 #endif
 
 #endif

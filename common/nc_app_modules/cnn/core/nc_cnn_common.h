@@ -166,6 +166,10 @@ typedef struct {
     stClassSegs class_segs;
     void* seg;
     stLaneDet lane_det[MAX_LANE_DET_CNT];
+    /* lane points of this frame only, copied before USE_UFLD_TRACKING averages
+     * lane_det over up to 20 frames (used to measure the per-frame horizon) */
+    stLaneDet lane_det_raw[MAX_LANE_DET_CNT];
+    int lane_raw_valid;
 } stCnnPostprocessingResults;
 
 #endif // __NC_CNN_COMMON_H__
