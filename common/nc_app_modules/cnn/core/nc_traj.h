@@ -36,6 +36,8 @@ extern "C" {
 #define NC_TRAJ_MIN_HIST                (3)     /* measurements needed before predicting */
 #define NC_TRAJ_MAX_PREDICT_MS_DEFAULT  (120)   /* extrapolation cap (100~150 ms) */
 #define NC_TRAJ_STALE_US                (500000ULL) /* drop track not measured for this long */
+#define NC_TRAJ_FUTURE_MS_DEFAULT       (500)   /* future trajectory horizon (draw / cut-in) */
+#define NC_TRAJ_FUTURE_MS_MAX           (1000)  /* CV model is unreliable beyond this */
 
 typedef struct {
     float    cx, cy;
@@ -64,6 +66,16 @@ void nc_traj_predict_frame(int ch, uint64_t target_time_us);
  * not a vehicle, or history < NC_TRAJ_MIN_HIST. */
 int nc_traj_get_predicted_box(int ch, int class_id, int track_id,
                               uint64_t target_time_us, stBBox *out);
+
+/* [render thread] after nc_traj_predict_frame(). Box center horizon_ms AFTER
+ * target_time_us (future trajectory, for the prediction line and cut-in).
+ * Uses the same snapshot / velocity as nc_traj_get_predicted_box(), but its own
+ * cap: dt = min(now - last_meas, max_predict) + min(horizon, FUTURE_MS_MAX).
+ * Returns 1 and fills *cx,*cy (screen px); 0 under the same conditions as
+ * nc_traj_get_predicted_box(). */
+int nc_traj_get_future_center(int ch, int class_id, int track_id,
+                              uint64_t target_time_us, float horizon_ms,
+                              float *cx, float *cy);
 
 /* [any thread] copy position history (oldest first). Returns count. */
 int nc_traj_get_history(int ch, int class_id, int track_id,

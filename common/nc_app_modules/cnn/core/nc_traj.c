@@ -256,25 +256,40 @@ void nc_traj_predict_frame(int ch, uint64_t target_time_us)
     sn->target_us = target_time_us;
 }
 
-int nc_traj_get_predicted_box(int ch, int class_id, int track_id,
-                              uint64_t target_time_us, stBBox *out)
+/* render snapshot lookup: predictable track or NULL */
+static const stTrajSnap *snap_find(int ch, int class_id, int track_id)
 {
-    if (ch < 0 || ch >= NC_TRAJ_MAX_CH || track_id < 0 || out == NULL) return 0;
+    if (ch < 0 || ch >= NC_TRAJ_MAX_CH || track_id < 0) return NULL;
     const stTrajSnapCh *sn = &g_snap[ch];
-    if (sn->gen != __atomic_load_n(&g_gen, __ATOMIC_ACQUIRE)) return 0; /* reset since snapshot */
+    if (sn->gen != __atomic_load_n(&g_gen, __ATOMIC_ACQUIRE)) return NULL; /* reset since snapshot */
 
     for (int i = 0; i < sn->cnt; i++) {
         const stTrajSnap *s = &sn->s[i];
         if (s->class_id != class_id || s->track_id != track_id) continue;
-        if (!s->predictable) return 0;
+        return s->predictable ? s : NULL;
+    }
+    return NULL;
+}
 
-        /* dt from last measurement to the displayed frame, capped */
-        float dt = 0.0f;
-        if (target_time_us > s->last_meas_us) {
-            dt = (float)(target_time_us - s->last_meas_us) * 1e-6f;
-        }
-        float max_dt = g_max_predict_ms * 1e-3f;
-        if (dt > max_dt) dt = max_dt;
+/* dt (s) from last measurement to the displayed frame, capped */
+static float snap_now_dt(const stTrajSnap *s, uint64_t target_time_us)
+{
+    float dt = 0.0f;
+    if (target_time_us > s->last_meas_us) {
+        dt = (float)(target_time_us - s->last_meas_us) * 1e-6f;
+    }
+    float max_dt = g_max_predict_ms * 1e-3f;
+    if (dt > max_dt) dt = max_dt;
+    return dt;
+}
+
+int nc_traj_get_predicted_box(int ch, int class_id, int track_id,
+                              uint64_t target_time_us, stBBox *out)
+{
+    if (out == NULL) return 0;
+    const stTrajSnap *s = snap_find(ch, class_id, track_id);
+    if (s != NULL) {
+        float dt = snap_now_dt(s, target_time_us);
 
         float cx = s->cx + s->vx * dt;
         float cy = s->cy + s->vy * dt;
@@ -285,6 +300,23 @@ int nc_traj_get_predicted_box(int ch, int class_id, int track_id,
         return 1;
     }
     return 0;
+}
+
+int nc_traj_get_future_center(int ch, int class_id, int track_id,
+                              uint64_t target_time_us, float horizon_ms,
+                              float *cx, float *cy)
+{
+    if (cx == NULL || cy == NULL) return 0;
+    const stTrajSnap *s = snap_find(ch, class_id, track_id);
+    if (s == NULL) return 0;
+
+    if (horizon_ms < 0.0f) horizon_ms = 0.0f;
+    if (horizon_ms > (float)NC_TRAJ_FUTURE_MS_MAX) horizon_ms = (float)NC_TRAJ_FUTURE_MS_MAX;
+    float dt = snap_now_dt(s, target_time_us) + horizon_ms * 1e-3f;
+
+    *cx = s->cx + s->vx * dt;
+    *cy = s->cy + s->vy * dt;
+    return 1;
 }
 
 int nc_traj_get_history(int ch, int class_id, int track_id,

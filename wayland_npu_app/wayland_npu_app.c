@@ -494,6 +494,9 @@ int v4l2_initialize(void)
 // Written and read only in the render thread.
 static uint64_t g_disp_frame_ts_us[VIDEO_MAX_CH];
 
+// prediction line shorter than this (screen px) is not drawn
+#define PRED_LINE_MIN_PX    (15.0f)
+
 void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *net_result, struct gl_npu_program g_npu_prog)
 {
     stCnnPostprocessingResults *det_result = &net_result->cnn_result;
@@ -529,14 +532,32 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                 stObjInfo obj_info = det_result->class_objs[i].objs[bidx];
                 // predicted box if available (vehicle, enough history), else measured box.
                 // Only the drawn copy changes; det_result / tracker input stay measured.
+                int   has_future = 0;
+                float fut_cx = 0.f, fut_cy = 0.f;
                 if (net_result->cam_channel < VIDEO_MAX_CH) {
+                    int      tch    = (int)net_result->cam_channel;
+                    uint64_t disp_t = g_disp_frame_ts_us[tch];
                     stBBox pred_box;
-                    if (nc_traj_get_predicted_box((int)net_result->cam_channel, i, obj_info.track_id,
-                                                  g_disp_frame_ts_us[net_result->cam_channel], &pred_box)) {
+                    if (nc_traj_get_predicted_box(tch, i, obj_info.track_id, disp_t, &pred_box)) {
                         obj_info.bbox = pred_box;
+                        // future center (same snapshot) for the prediction line
+                        has_future = nc_traj_get_future_center(tch, i, obj_info.track_id, disp_t,
+                                                               (float)NC_TRAJ_FUTURE_MS_DEFAULT,
+                                                               &fut_cx, &fut_cy);
                     }
                 }
                 nc_opengl_draw_rectangle(obj_info.bbox.x, obj_info.bbox.y, obj_info.bbox.w, obj_info.bbox.h, color[i], g_npu_prog);
+
+                // prediction line: current (predicted-now) center -> center after FUTURE_MS, dashed
+                // Hidden when shorter than PRED_LINE_MIN_PX: cars followed at similar speed barely
+                // move on screen, and their short line only shows bbox jitter.
+                float cur_cx = obj_info.bbox.x + obj_info.bbox.w * 0.5f;
+                float cur_cy = obj_info.bbox.y + obj_info.bbox.h * 0.5f;
+                float ldx = fut_cx - cur_cx, ldy = fut_cy - cur_cy;
+                if (has_future && (ldx * ldx + ldy * ldy) >= PRED_LINE_MIN_PX * PRED_LINE_MIN_PX) {
+                    nc_opengl_draw_line(cur_cx, cur_cy, fut_cx, fut_cy, 2 /* dashed */, color[i], g_npu_prog);
+                    nc_opengl_draw_rectangle(fut_cx - 4.f, fut_cy - 4.f, 8.f, 8.f, color[i], g_npu_prog); // end marker
+                }
 
                 // draw bbox label
 #ifdef USE_BYTETRACK
