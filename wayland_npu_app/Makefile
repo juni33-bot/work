@@ -156,6 +156,7 @@ endif
 
 ifeq ($(USE_LDW)$(USE_CNN_UFLD_NETWORK), yesyes)
 INC_DIR             += -I$(NC_APP_MODULES)/ldw
+INC_DIR             += -I$(NC_APP_MODULES)/minimap
 endif
 #############################################################
 
@@ -310,6 +311,7 @@ CSRCS               := wayland_npu_app.c
 CSRCS               += $(NC_APP_MODULES)/v4l2/v4l2_interface.c
 CSRCS               += $(NC_APP_MODULES)/config/nc_cnn_config_parser.c
 CSRCS               += $(NC_APP_MODULES)/utils/nc_utils.c
+CSRCS               += $(NC_APP_MODULES)/utils/nc_bevlog.c
 CSRCS               += $(INILIB_DIR)/ini.c
 CSRCS               += $(NC_APP_MODULES)/config/nc_app_config_parser.c
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_cnn_aiware_runtime.c
@@ -346,6 +348,7 @@ CSRCS              += $(NC_NEON_DIR)/nc_neon.c
 
 ifeq ($(USE_LDW)$(USE_CNN_UFLD_NETWORK), yesyes)
 CSRCS               += $(NC_APP_MODULES)/ldw/nc_ldw.c
+CSRCS               += $(NC_APP_MODULES)/minimap/nc_minimap.c
 endif
 
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_traj.c

@@ -74,8 +74,11 @@
 #endif
 #include "nc_traj.h"
 #include "nc_cutin.h"
+#include "nc_bevlog.h"
 #ifdef USE_LDW
 #include "nc_ldw.h"
+#include "nc_minimap.h"
+#include "nc_class.h"
 #endif
 
 #ifdef USE_8MP_VI
@@ -501,6 +504,9 @@ static uint64_t g_disp_frame_ts_us[VIDEO_MAX_CH];
 // prediction line shorter than this (screen px) is not drawn
 #define PRED_LINE_MIN_PX    (15.0f)
 
+// 1: append road distance "z m(x)" to each bbox label (debug, labels may overlap)
+#define SHOW_OBJ_DISTANCE   (0)
+
 // cut-in warning box / text color (yellow: car class is already red)
 static float g_cutin_color[4] = {1.0f, 0.9f, 0.0f, 1.0f};
 
@@ -537,6 +543,9 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
         // cut-in judgement runs once per displayed frame of this channel
         int cut_ch = (net_result->cam_channel < VIDEO_MAX_CH) ? (int)net_result->cam_channel : -1;
         if (cut_ch >= 0) nc_cutin_begin_frame(cut_ch, g_disp_frame_ts_us[cut_ch]);
+#ifdef USE_LDW
+        if (cut_ch >= 0) nc_minimap_begin_frame((uint32_t)cut_ch, g_disp_frame_ts_us[cut_ch]);
+#endif
 
         for(int i=0; i<draw_cnn->max_class_cnt; i++){
             for(int bidx = 0; bidx < det_result->class_objs[i].obj_cnt; bidx++) {
@@ -544,6 +553,7 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                 // predicted box if available (vehicle, enough history), else measured box.
                 // Only the drawn copy changes; det_result / tracker input stay measured.
                 int   has_future = 0;
+                int   pred_valid = 0;
                 float fut_cx = 0.f, fut_cy = 0.f;
                 if (net_result->cam_channel < VIDEO_MAX_CH) {
                     int      tch    = (int)net_result->cam_channel;
@@ -551,6 +561,7 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                     stBBox pred_box;
                     if (nc_traj_get_predicted_box(tch, i, obj_info.track_id, disp_t, &pred_box)) {
                         obj_info.bbox = pred_box;
+                        pred_valid = 1;
                         // future center (same snapshot) for the prediction line
                         has_future = nc_traj_get_future_center(tch, i, obj_info.track_id, disp_t,
                                                                (float)NC_TRAJ_FUTURE_MS_DEFAULT,
@@ -591,6 +602,36 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                 sprintf(buftext, "%s:%0.2f", draw_cnn->class_names[i], obj_info.prob);
 #endif
                 if (is_cutin) sprintf(buftext, "[%d]CUT-IN", obj_info.track_id);
+#ifdef USE_LDW
+                // minimap: vehicles only (position from the bbox bottom-center)
+                if (cut_ch >= 0 && nc_class_is_vehicle(net_result->net_id, i)) {
+                    stNcMinimapObj mo;
+                    memset(&mo, 0, sizeof(mo));
+                    mo.class_name = draw_cnn->class_names[i];
+                    mo.track_id   = obj_info.track_id;
+                    mo.meas       = det_result->class_objs[i].objs[bidx].bbox;   // tracker output
+                    mo.shown      = obj_info.bbox;                               // drawn (predicted) box
+                    mo.pred_valid = pred_valid;
+                    mo.t_det_us   = net_result->time_stamp;
+                    mo.t_disp_us  = g_disp_frame_ts_us[cut_ch];
+                    memcpy(mo.color, dcolor, sizeof(mo.color));
+                    mo.highlight  = is_cutin;
+                    nc_minimap_add_obj((uint32_t)cut_ch, &mo);
+                }
+#endif
+#if defined(USE_LDW) && SHOW_OBJ_DISTANCE
+                // distance check: road position of the bbox bottom-center (ground contact point)
+                if (cut_ch >= 0) {
+                    float x_m, z_m;
+                    if (nc_ldw_app_pixel_to_road((uint32_t)cut_ch,
+                                                 obj_info.bbox.x + obj_info.bbox.w * 0.5f,
+                                                 obj_info.bbox.y + obj_info.bbox.h,
+                                                 &x_m, &z_m) == 0 && z_m > 0.f) {
+                        size_t n = strlen(buftext);
+                        snprintf(buftext + n, sizeof(buftext) - n, " %.1fm(%+.1f)", z_m, x_m);
+                    }
+                }
+#endif
                 float textcolor[3] = {dcolor[RGBA_R], dcolor[RGBA_G], dcolor[RGBA_B]};
                 nc_opengl_draw_text(&font_24, buftext, obj_info.bbox.x, (float)WINDOW_HEIGHT - (obj_info.bbox.y-12), target_view_ratio, textcolor, WINDOW_WIDTH, WINDOW_HEIGHT, g_font_prog);
             }
@@ -978,6 +1019,17 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
         else{
             uint64_t time_stamp = 0;
 
+        #if defined(LANE_NETWORK) && defined(USE_LDW)
+            // LDW first: the minimap looks up the horizon of each detection's own
+            // lane frame, so that frame must be processed before the boxes are drawn.
+            // (short read lock: the lane buffer is read again below for drawing)
+            {
+                pp_result_buf *ldw_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+LANE_NETWORK, &time_stamp);
+                nc_ldw_app_process(ch, ldw_buf);
+                nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
+            }
+        #endif
+
         #ifdef DETECT_NETWORK
             pp_result_buf *det_buf = NULL;
             det_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+DETECT_NETWORK, &time_stamp);
@@ -1005,14 +1057,14 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (lane_buf) {
                 nc_draw_gl_npu(g_viewport[ch], lane_buf->net_task, lane_buf, g_npu_prog);
             }
-        #ifdef USE_LDW
-            nc_ldw_app_process(ch, lane_buf);          // inside the buffer lock (before finish_read)
-        #endif
             nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
         #ifdef USE_LDW
             {
                 stNcLdwDrawRes ldw_res = { &font_24, &font_38, &g_font_prog, &g_npu_prog };
                 nc_ldw_app_draw(ch, g_viewport[ch], &ldw_res);
+
+                stNcMinimapDrawRes mm_res = { &font_24, &g_font_prog, &g_npu_prog };
+                nc_minimap_draw(ch, g_viewport[ch], &mm_res);
             }
         #endif
         #endif
@@ -1034,6 +1086,8 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
     opengl_time = ((end.tv_sec - begin.tv_sec)*1000 + (end.tv_nsec - begin.tv_nsec)/1000000);
 
     frametime = ((end.tv_sec - set_time.tv_sec)*1000 + (end.tv_nsec - set_time.tv_nsec)/1000000);
+    nc_bevlog_row(NC_BEVLOG_FRAME, "%llu,%lu,%lu", (unsigned long long)nc_get_mono_us_time(),
+                  (unsigned long)opengl_time, (unsigned long)frametime);
 
     set_time = end;
 

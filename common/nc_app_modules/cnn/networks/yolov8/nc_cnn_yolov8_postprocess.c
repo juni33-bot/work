@@ -26,6 +26,7 @@
 */
 
 #include "nc_cnn_aiware_runtime.h"
+#include "nc_bevlog.h"
 #include "nc_cnn_yolov8_postprocess.h"
 #include "nc_cnn_anchor.h"
 #include "math.h"
@@ -204,6 +205,19 @@ static void nc_postprocess_yolov8_detections(unsigned int target_w, unsigned int
 #endif
 
     nc_yolov8_store_postprocess_results(dets, &det_num, out_cnn_results);
+        // diagnostics: raw detections before the tracker overwrites them
+        if (nc_bevlog_enabled()) {
+            for (int c = 0; c < g_yolov8_net_info->class_num && c < MAX_CNN_CLASS_CNT; c++) {
+                for (int n = 0; n < out_cnn_results->class_objs[c].obj_cnt && n < MAX_CNN_RESULT_CNT_OF_CLASS; n++) {
+                    const stObjInfo *o = &out_cnn_results->class_objs[c].objs[n];
+                    nc_bevlog_row(NC_BEVLOG_DET, "%llu,%u,%s,%.1f,%.1f,%.1f,%.1f,%.3f",
+                                  (unsigned long long)cnn_output->time_stamp_us, cnn_output->cam_ch,
+                                  g_yolov8_net_info->class_name[c],
+                                  (double)o->bbox.x, (double)o->bbox.y, (double)o->bbox.w, (double)o->bbox.h,
+                                  (double)o->prob);
+                }
+            }
+        }
 #ifdef USE_BYTETRACK
         // Execute tracker
         nc_cnn_track(out_cnn_results, cnn_output->net_id, cnn_output->cam_ch);
