@@ -173,7 +173,9 @@ st_nc_v4l2_config v4l2_config[VIDEO_MAX_CH];
 /*
  * File input mode: decode a video file with ffmpeg (popen) instead of the camera.
  * ffmpeg outputs interleaved RGB24 at NPU input resolution, paced at real time (-re),
- * looping forever (-stream_loop -1).
+ * looping forever (-stream_loop -1). Only the first video stream is decoded
+ * (audio / metadata tracks of phone .mov files can stop -stream_loop in ffmpeg 4.x).
+ * If the stream still ends, ffmpeg is restarted so the video plays from the start again.
  * The pipe fd is stored in video_fd so that existing "video_fd != -1" checks keep working.
  */
 #define FILE_INPUT_FFMPEG_PATH      "misc/ffmpeg"
@@ -183,12 +185,14 @@ st_nc_v4l2_config v4l2_config[VIDEO_MAX_CH];
 static const char *g_file_input_path = NULL;    // set by "-i <file>", NULL -> default
 static FILE *g_file_input_fp[VIDEO_MAX_CH];
 static unsigned char *g_file_input_frame[VIDEO_MAX_CH];   // interleaved RGB24
+static char g_file_input_cmd[1024];                        // ffmpeg command (for restart)
+#define FILE_INPUT_MAX_RESTART      (3)    // consecutive restarts without a frame -> give up
 
 static int file_input_initialize(void)
 {
     char ffmpeg_path[256];
     char video_path[256];
-    char cmd[1024];
+    char *cmd = g_file_input_cmd;
 
     snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", nc_localize_path(FILE_INPUT_FFMPEG_PATH));
     if (g_file_input_path) {
@@ -202,9 +206,9 @@ static int file_input_initialize(void)
         return -1;
     }
 
-    snprintf(cmd, sizeof(cmd),
+    snprintf(cmd, sizeof(g_file_input_cmd),
              "%s -loglevel error -nostdin -stream_loop -1 -re -i \"%s\" "
-             "-vf scale=%d:%d -pix_fmt rgb24 -f rawvideo -",
+             "-map 0:v:0 -an -vf scale=%d:%d -pix_fmt rgb24 -f rawvideo -",
              ffmpeg_path, video_path, NPU_INPUT_WIDTH, NPU_INPUT_HEIGHT);
 
     for (int i = 0; i < VIDEO_MAX_CH; i++) {
@@ -229,18 +233,31 @@ static int file_input_initialize(void)
 // read one full frame (blocking). returns 0 on success, -1 on EOF/error
 static int file_input_read_frame(int ch)
 {
+    static int restart_cnt[VIDEO_MAX_CH];
     size_t total = 0;
 
     while (total < FILE_INPUT_FRAME_SIZE) {
         size_t n = fread(g_file_input_frame[ch] + total, 1, FILE_INPUT_FRAME_SIZE - total, g_file_input_fp[ch]);
         if (n == 0) {
-            printf("[error] ffmpeg stream ended (ch%d). check ffmpeg / video file\n", ch);
-            v4l2_config[ch].video_buf.video_fd = -1;    // fall back to logo image
-            return -1;
+            // stream ended (loop failed): restart ffmpeg from the beginning
+            pclose(g_file_input_fp[ch]);
+            g_file_input_fp[ch] = NULL;
+            if (restart_cnt[ch] >= FILE_INPUT_MAX_RESTART ||
+                (g_file_input_fp[ch] = popen(g_file_input_cmd, "r")) == NULL) {
+                printf("[error] ffmpeg stream ended (ch%d). check ffmpeg / video file\n", ch);
+                v4l2_config[ch].video_buf.video_fd = -1;    // fall back to logo image
+                return -1;
+            }
+            restart_cnt[ch]++;
+            printf("[file input] ch%d : stream ended, restarting ffmpeg (%d)\n", ch, restart_cnt[ch]);
+            v4l2_config[ch].video_buf.video_fd = fileno(g_file_input_fp[ch]);
+            total = 0;                                  // drop the partial frame
+            continue;
         }
         total += n;
     }
 
+    restart_cnt[ch] = 0;
     return 0;
 }
 

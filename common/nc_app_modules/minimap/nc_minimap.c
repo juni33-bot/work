@@ -42,11 +42,16 @@
 #define MM_CLS_DECAY        (0.8f)
 #define MM_CLS_SWITCH       (1.0f)      // other class must lead by this much to switch
 
-/* lanes: consecutive network points are joined like the camera overlay. A gap
- * longer than this is a straight interpolation between two real points
- * (beyond ~14 m the rows are far apart) and is drawn faint. */
-#define MM_LANE_INTERP_GAP_M (8.0f)
-#define MM_LANE_INTERP_ALPHA (0.35f)
+/* lanes: the network points of each line are fitted in road coordinates with
+ * x = a + b*z (+ c*z^2) and the fit is drawn over the whole panel height
+ * (behind the camera to NC_MINIMAP_RANGE_M). The part outside the real points
+ * is an extrapolation and is drawn fainter. */
+#define MM_LANE_MAX_Z_M      (60.0f)    // ignore points farther than this (noisy)
+#define MM_LANE_MIN_SPAN_M   (3.0f)     // need points over at least this z span
+#define MM_LANE_QUAD_SPAN_M  (8.0f)     // quadratic term only with this much span and >= 4 points
+#define MM_LANE_MAX_CURV     (0.003f)   // |c| limit (1/(2R), R ~ 170 m): no wild bends
+#define MM_LANE_SEG_M        (4.0f)     // drawn segment length
+#define MM_LANE_EXTRAP_ALPHA (0.55f)    // alpha factor of the extrapolated part
 
 /* ego vehicle body relative to the camera (m) */
 #define MM_EGO_W_M          (1.85f)
@@ -309,7 +314,7 @@ static void mm_process(uint32_t ch)
         stMmTrack *t = &c->track[i];
         if (!t->used) continue;
         if (!t->in_range && t->z <= NC_MINIMAP_RANGE_M - NC_MINIMAP_RANGE_HYST_M) t->in_range = 1;
-        else if (t->in_range && t->z > NC_MINIMAP_RANGE_M + NC_MINIMAP_RANGE_HYST_M) t->in_range = 0;
+        else if (t->in_range && t->z > NC_MINIMAP_RANGE_M) t->in_range = 0;
     }
 }
 
@@ -431,10 +436,47 @@ static void mm_road_seg(float x0, float z0, float x1, float z1, int dashed, cons
                         dashed ? 2 : 1, c, *p);
 }
 
+/* weighted least squares x = a + b z (+ c z^2). Near points weigh more (their
+ * road position is more accurate). Returns 0 on success. */
+static int mm_lane_fit(const float *xs, const float *zs, int m, int quad, float coef[3])
+{
+    double S[5] = {0}, T[3] = {0};               // sum w z^k (k 0..4), sum w x z^k (k 0..2)
+    for (int j = 0; j < m; j++) {
+        double w = 1.0 / (1.0 + zs[j] * 0.1), zk = 1.0;
+        for (int k = 0; k < 5; k++) { S[k] += w * zk; if (k < 3) T[k] += w * xs[j] * zk; zk *= zs[j]; }
+    }
+    coef[0] = coef[1] = coef[2] = 0.0f;
+    if (quad) {                                   // 3x3 normal equations (Cramer)
+        double A[3][3] = { {S[0], S[1], S[2]}, {S[1], S[2], S[3]}, {S[2], S[3], S[4]} };
+        double det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1])
+                   - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0])
+                   + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+        if (fabs(det) > 1e-9) {
+            double r[3];
+            for (int col = 0; col < 3; col++) {
+                double B[3][3];
+                memcpy(B, A, sizeof(B));
+                for (int row = 0; row < 3; row++) B[row][col] = T[row];
+                r[col] = (B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1])
+                        - B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0])
+                        + B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0])) / det;
+            }
+            if (fabs(r[2]) <= MM_LANE_MAX_CURV) {
+                coef[0] = (float)r[0]; coef[1] = (float)r[1]; coef[2] = (float)r[2];
+                return 0;
+            }
+        }
+        // singular or too curved: fall back to a straight line
+    }
+    double det = S[0] * S[2] - S[1] * S[1];
+    if (fabs(det) < 1e-9) return -1;
+    coef[1] = (float)((S[0] * T[1] - S[1] * T[0]) / det);
+    coef[0] = (float)((T[0] - coef[1] * S[1]) / S[0]);
+    return 0;
+}
+
 /* Lane lines from the network points of the newest lane frame, with the same
- * geometry as the vehicles. Consecutive points are joined (like the camera
- * overlay); nothing beyond the last point. A long gap is a straight
- * interpolation between two real points: drawn faint.
+ * geometry as the vehicles, fitted and drawn over the whole panel height.
  * Style: lane class 1 = solid, 2 = dashed, other = dashed (never guessed solid);
  * NC_MINIMAP_USE_LANE_CLASS 0 = all dashed. Ego-lane boundaries white, others grey. */
 static void mm_draw_lanes(uint32_t ch, const struct gl_npu_program *p)
@@ -454,29 +496,48 @@ static void mm_draw_lanes(uint32_t ch, const struct gl_npu_program *p)
         if (n < 2) continue;
 
         float xs[MAX_POINT_CNT_OF_LANE], zs[MAX_POINT_CNT_OF_LANE];
+        float zmin = 1e9f, zmax = -1e9f;
         int m = 0;
         for (int j = 0; j < n; j++) {
             float u = ln->point[j].x, v = ln->point[j].y;
             if (!isfinite(u) || !isfinite(v) || (u <= 0.0f && v <= 0.0f)) continue;
             float x, z;
-            if (nc_ldw_geom_to_road(ch, &g, u, v, &x, &z) != 0 || z <= 0.0f) continue;
-            int k = m++;                                  // insertion by distance
-            while (k > 0 && zs[k - 1] > z) { zs[k] = zs[k - 1]; xs[k] = xs[k - 1]; k--; }
-            zs[k] = z; xs[k] = x;
+            if (nc_ldw_geom_to_road(ch, &g, u, v, &x, &z) != 0 || z <= 0.0f || z > MM_LANE_MAX_Z_M) continue;
+            xs[m] = x; zs[m] = z; m++;
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
         }
+        if (m < 2 || zmax - zmin < MM_LANE_MIN_SPAN_M) continue;
+
+        float cf[3];
+        int quad = (m >= 4 && zmax - zmin >= MM_LANE_QUAD_SPAN_M);
+        if (mm_lane_fit(xs, zs, m, quad, cf) != 0) continue;
 
         int ego = (i == (int)NC_LDW_EGO_LANE.left_boundary_index ||
                    i == (int)NC_LDW_EGO_LANE.right_boundary_index);
         int dashed = NC_MINIMAP_USE_LANE_CLASS ? (ln->lane_class != 1) : 1;
         const float *col = ego ? ego_col : adj_col;
-        for (int j = 0; j + 1 < m; j++) {
-            if (zs[j] >= NC_MINIMAP_RANGE_M) break;      // clipped at the panel top
-            if (zs[j + 1] - zs[j] > MM_LANE_INTERP_GAP_M) {
-                float fc[4] = {col[0], col[1], col[2], MM_LANE_INTERP_ALPHA};
-                mm_road_seg(xs[j], zs[j], xs[j + 1], zs[j + 1], dashed, fc, p);
-            } else {
-                mm_road_seg(xs[j], zs[j], xs[j + 1], zs[j + 1], dashed, col, p);
-            }
+        const float fcol[4] = {col[0], col[1], col[2], col[3] * MM_LANE_EXTRAP_ALPHA};
+
+        // segment ends: panel bottom .. panel top, split at the real-point range
+        float zb[16];
+        int nb = 0;
+        const float z_lo = -MM_BEHIND_M, z_hi = NC_MINIMAP_RANGE_M;
+        const float cuts[2] = { zmin, zmax };
+        zb[nb++] = z_lo;
+        for (float z = z_lo + MM_LANE_SEG_M; ; z += MM_LANE_SEG_M) {
+            for (int k = 0; k < 2; k++)                   // insert the cuts in order
+                if (cuts[k] > zb[nb - 1] && cuts[k] < fminf(z, z_hi) && nb < 15) zb[nb++] = cuts[k];
+            if (z >= z_hi || nb >= 15) { zb[nb++] = z_hi; break; }
+            zb[nb++] = z;
+        }
+        for (int k = 0; k + 1 < nb; k++) {
+            float z0 = zb[k], z1 = zb[k + 1];
+            if (z1 - z0 < 0.05f) continue;
+            float x0 = cf[0] + cf[1] * z0 + cf[2] * z0 * z0;
+            float x1 = cf[0] + cf[1] * z1 + cf[2] * z1 * z1;
+            float zm = 0.5f * (z0 + z1);
+            mm_road_seg(x0, z0, x1, z1, dashed, (zm >= zmin && zm <= zmax) ? col : fcol, p);
         }
     }
 }

@@ -27,8 +27,12 @@
 #include "nc_opengl_ttf_font.h"
 #include "nc_cnn_common.h"
 
-#define NC_MINIMAP_RANGE_M      (40.0f)   // forward range shown (m)
-#define NC_MINIMAP_RANGE_HYST_M (2.0f)    // appear below RANGE-HYST, disappear above RANGE+HYST
+/* Forward display range (m). Temporarily 25 m (was 40 m) while the far-range
+ * jitter is analysed; set back to 40.0f to restore. Display only: positions,
+ * smoothing and the NC_BEV_LOG rows are computed for every vehicle. */
+#define NC_MINIMAP_DISPLAY_RANGE_M (25.0f)
+#define NC_MINIMAP_RANGE_M      NC_MINIMAP_DISPLAY_RANGE_M
+#define NC_MINIMAP_RANGE_HYST_M (2.0f)    // appear at <= RANGE-HYST, disappear above RANGE (never drawn beyond RANGE)
 #define NC_MINIMAP_LAT_RANGE_M  (9.0f)    // lateral range each side (m): ego lane + 2 lanes
 #define NC_MINIMAP_BG_ALPHA     (0.92f)   // panel background opacity
 
