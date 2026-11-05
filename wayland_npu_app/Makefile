@@ -335,9 +335,7 @@ CSRCS              += $(NC_OPENGL_DIR)/nc_opengl_shader.c
 CSRCS              += $(NC_NEON_DIR)/nc_neon.c
 
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_traj.c
-CSRCS               += $(NC_CNN_CORE_DIR)/nc_meas.c
-CSRCS               += $(NC_CNN_CORE_DIR)/nc_model.c
-CSRCS               += $(NC_CNN_CORE_DIR)/nc_run_mode.c
+CSRCS               += $(NC_CNN_CORE_DIR)/nc_class.c
 
 ifeq ($(USE_BYTETRACK), yes)
 CSRCS               += $(NC_CNN_CORE_DIR)/nc_cnn_tracker.c

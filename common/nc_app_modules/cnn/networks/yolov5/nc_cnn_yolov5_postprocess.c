@@ -42,7 +42,6 @@
 #include "nc_ts_fsync_flipflop_buffers.h"
 #ifdef USE_BYTETRACK
 #include "nc_cnn_tracker.h"
-#include "nc_meas.h"
 #include "nc_traj.h"
 #endif
 
@@ -249,7 +248,6 @@ void postprocess_yolov5_detections(unsigned int canvas_w, unsigned int canvas_h,
         pp_buf->net_task = DETECTION;
 
         nc_tsfs_ff_finish_write_buf(cnn_output->cam_ch+DETECT_NETWORK);
-        nc_meas_on_pipeline_done(cnn_output->cam_ch, time_stamp);
     }
 
     #ifdef PRINT_AVERAGE_PROCESS_TIME

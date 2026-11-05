@@ -1,5 +1,5 @@
 #include "nc_traj.h"
-#include "nc_model.h"
+#include "nc_class.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -176,7 +176,7 @@ void nc_traj_update(int ch, E_NETWORK_UID net_id,
         const stClassObjs *co = &results->class_objs[c];
         if (co->obj_cnt <= 0) continue;
 
-        int is_vehicle = nc_model_is_vehicle(net_id, c);
+        int is_vehicle = nc_class_is_vehicle(net_id, c);
 
         for (int n = 0; n < co->obj_cnt && n < MAX_CNN_RESULT_CNT_OF_CLASS; n++) {
             const stObjInfo *o = &co->objs[n];

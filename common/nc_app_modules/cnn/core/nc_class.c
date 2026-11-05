@@ -1,5 +1,5 @@
 #include <stdint.h>
-#include "nc_model.h"
+#include "nc_class.h"
 #include "nc_cnn_config_parser.h"
 
 #include <pthread.h>
@@ -7,7 +7,7 @@
 #include <string.h>
 #include <strings.h>
 
-#define NC_MODEL_MAX_CLASS  (256)
+#define NC_CLASS_MAX_CLASS  (256)
 
 /* names from network ini class_name that count as vehicle */
 static const char *const k_vehicle_names[] = {
@@ -21,11 +21,11 @@ static const char *const k_vehicle_names[] = {
 typedef struct {
     int     built;
     int     class_num;
-    uint8_t is_vehicle[NC_MODEL_MAX_CLASS];
-} stModelTable;
+    uint8_t is_vehicle[NC_CLASS_MAX_CLASS];
+} stClassTable;
 
-static stModelTable    g_model[MAX_NETWORK_IDS];
-static pthread_mutex_t g_model_lock = PTHREAD_MUTEX_INITIALIZER;
+static stClassTable    g_class[MAX_NETWORK_IDS];
+static pthread_mutex_t g_class_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int name_is_vehicle(const char *name)
 {
@@ -36,8 +36,8 @@ static int name_is_vehicle(const char *name)
     return 0;
 }
 
-/* caller holds g_model_lock */
-static int build_table(E_NETWORK_UID net_id, stModelTable *t)
+/* caller holds g_class_lock */
+static int build_table(E_NETWORK_UID net_id, stClassTable *t)
 {
     stNetwork_info *info = nc_cnn_get_network_info(net_id);
     if (info == NULL || info->class_name == NULL || info->class_num <= 0) {
@@ -45,13 +45,13 @@ static int build_table(E_NETWORK_UID net_id, stModelTable *t)
     }
 
     int n = info->class_num;
-    if (n > NC_MODEL_MAX_CLASS) {
-        printf("[nc_model] net_id:%d class_num %d > %d, clipped\n", (int)net_id, n, NC_MODEL_MAX_CLASS);
-        n = NC_MODEL_MAX_CLASS;
+    if (n > NC_CLASS_MAX_CLASS) {
+        printf("[nc_class] net_id:%d class_num %d > %d, clipped\n", (int)net_id, n, NC_CLASS_MAX_CLASS);
+        n = NC_CLASS_MAX_CLASS;
     }
 
     memset(t, 0, sizeof(*t));
-    printf("[nc_model] net_id:%d vehicle classes:", (int)net_id);
+    printf("[nc_class] net_id:%d vehicle classes:", (int)net_id);
     for (int i = 0; i < n; i++) {
         t->is_vehicle[i] = (uint8_t)name_is_vehicle(info->class_name[i]);
         if (t->is_vehicle[i]) printf(" %d(%s)", i, info->class_name[i]);
@@ -62,23 +62,23 @@ static int build_table(E_NETWORK_UID net_id, stModelTable *t)
     return 0;
 }
 
-int nc_model_is_vehicle(E_NETWORK_UID net_id, int class_id)
+int nc_class_is_vehicle(E_NETWORK_UID net_id, int class_id)
 {
     if ((int)net_id < 0 || (int)net_id >= (int)MAX_NETWORK_IDS || class_id < 0) return 0;
 
     int ret = 0;
-    pthread_mutex_lock(&g_model_lock);
-    stModelTable *t = &g_model[(int)net_id];
+    pthread_mutex_lock(&g_class_lock);
+    stClassTable *t = &g_class[(int)net_id];
     if (t->built || build_table(net_id, t) == 0) {
         if (class_id < t->class_num) ret = t->is_vehicle[class_id];
     }
-    pthread_mutex_unlock(&g_model_lock);
+    pthread_mutex_unlock(&g_class_lock);
     return ret;
 }
 
-void nc_model_reset(void)
+void nc_class_reset(void)
 {
-    pthread_mutex_lock(&g_model_lock);
-    memset(g_model, 0, sizeof(g_model));
-    pthread_mutex_unlock(&g_model_lock);
+    pthread_mutex_lock(&g_class_lock);
+    memset(g_class, 0, sizeof(g_class));
+    pthread_mutex_unlock(&g_class_lock);
 }

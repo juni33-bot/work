@@ -72,8 +72,6 @@
 #ifdef USE_BYTETRACK
 #include "nc_cnn_tracker.h"
 #endif
-#include "nc_meas.h"
-#include "nc_run_mode.h"
 #include "nc_traj.h"
 
 #ifdef USE_8MP_VI
@@ -820,8 +818,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 uint64_t frame_ts_us = nc_get_mono_us_time();
                 g_disp_frame_ts_us[i] = frame_ts_us;
 
-                // LIGHT mode: send every 2nd frame to NPU
-                if (nc_run_mode_should_send((uint32_t)i))
+                // TODO(merge): 서영 FSM -- send this frame to NPU or not
                 {
                 uint64_t time_stamp_us = frame_ts_us;
                 networkOrder[i] = nc_get_cnn_networks_id();
@@ -857,8 +854,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 if (((framecnt % 2 == 0) && (i == 0 || i == 2)) ||
                     ((framecnt % 2 == 1) && (i == 1 || i == 3)))
 #endif
-                // LIGHT mode: send every 2nd eligible frame to NPU
-                if (nc_run_mode_should_send((uint32_t)i))
+                // TODO(merge): 서영 FSM -- send this frame to NPU or not
                 {
                     uint64_t time_stamp_us = frame_ts_us;
                     networkOrder[i] = nc_get_cnn_networks_id();
@@ -934,7 +930,6 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 // (one short lock per frame), then draw. Runs before swap.
                 nc_traj_predict_frame((int)ch, g_disp_frame_ts_us[ch]);
                 nc_draw_gl_npu(g_viewport[ch], det_buf->net_task, det_buf, g_npu_prog);
-                nc_meas_on_display(ch, time_stamp);
             }
             nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
         #endif
@@ -1104,8 +1099,7 @@ int npu_init(st_npu_input_info *npu_input_info)
         net_id = NETWORK_TRI_CHIMERA;
 #endif
 #ifndef SHOW_PELEE_SEG
-        // tracker runs at the per-channel NPU result rate (LIGHT: CAP_FPS/2)
-        if (nc_init_bytetrackers(CAP_FPS / nc_run_mode_npu_div(), i, net_id) != 0) {
+        if (nc_init_bytetrackers(CAP_FPS, i, net_id) != 0) {
             perror("nc_init_bytetrackers() error");
             return -1;
         }
@@ -1129,7 +1123,6 @@ static void usage(int error_code)
     fprintf(stderr, "Usage: simple-egl [OPTIONS]\n\n"
         "  -f\tRun in fullscreen mode\n"
         "  -o\tCreate an opaque surface\n"
-        "  -l\tLIGHT mode: send every 2nd frame to NPU\n"
 #ifdef USE_FILE_INPUT
         "  -i <file>\tInput video file (default: " FILE_INPUT_DEFAULT_VIDEO ")\n"
 #endif
@@ -1176,8 +1169,6 @@ int main(int argc, char **argv)
             window.opaque = 1;
         else if (strcmp("-h", argv[i]) == 0)
             usage(EXIT_SUCCESS);
-        else if (strcmp("-l", argv[i]) == 0)
-            nc_run_mode_set(NC_RUN_MODE_LIGHT);
 #ifdef USE_FILE_INPUT
         else if (strcmp("-i", argv[i]) == 0 && i + 1 < argc)
             g_file_input_path = argv[++i];

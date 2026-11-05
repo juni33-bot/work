@@ -42,7 +42,6 @@
 #include "nc_ts_fsync_flipflop_buffers.h"
 #ifdef USE_BYTETRACK
 #include "nc_cnn_tracker.h"
-#include "nc_meas.h"
 #include "nc_traj.h"
 #endif
 
@@ -210,13 +209,17 @@ static void nc_postprocess_yolov8_detections(unsigned int target_w, unsigned int
         nc_cnn_track(out_cnn_results, cnn_output->net_id, cnn_output->cam_ch);
         // trajectory: measurement update only (prediction is done in render loop)
         nc_traj_update((int)cnn_output->cam_ch, cnn_output->net_id, out_cnn_results, cnn_output->time_stamp_us);
-        for (int c = 0; c < g_yolov8_net_info->class_num; c++)
-        for (int n = 0; n < out_cnn_results->class_objs[c].obj_cnt; n++) {
-        stObjInfo *o = &out_cnn_results->class_objs[c].objs[n];
-        printf("[TRK] ts=%llu c=%d id=%d x=%.1f y=%.1f w=%.1f h=%.1f\n",
-               (unsigned long long)cnn_output->time_stamp_us, c, o->track_id,
-               o->bbox.x, o->bbox.y, o->bbox.w, o->bbox.h);
-    }
+#ifdef NC_TRAJ_DEBUG
+        // per-object track dump (every frame, every object): debug only, slow
+        for (int c = 0; c < g_yolov8_net_info->class_num; c++) {
+            for (int n = 0; n < out_cnn_results->class_objs[c].obj_cnt; n++) {
+                stObjInfo *o = &out_cnn_results->class_objs[c].objs[n];
+                printf("[TRK] ts=%llu c=%d id=%d x=%.1f y=%.1f w=%.1f h=%.1f\n",
+                       (unsigned long long)cnn_output->time_stamp_us, c, o->track_id,
+                       o->bbox.x, o->bbox.y, o->bbox.w, o->bbox.h);
+            }
+        }
+#endif
 #endif
         framecnt++;
     }
@@ -259,7 +262,6 @@ void postprocess_yolov8_detections(unsigned int canvas_w, unsigned int canvas_h,
         pp_buf->net_id = cnn_output->net_id;
         pp_buf->net_task = DETECTION;
         nc_tsfs_ff_finish_write_buf(cnn_output->cam_ch+DETECT_NETWORK);
-        nc_meas_on_pipeline_done(cnn_output->cam_ch, time_stamp);
     }
 
     #ifdef PRINT_AVERAGE_PROCESS_TIME

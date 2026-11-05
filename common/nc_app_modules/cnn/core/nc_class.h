@@ -1,8 +1,8 @@
-#ifndef NC_MODEL_H
-#define NC_MODEL_H
+#ifndef NC_CLASS_H
+#define NC_CLASS_H
 
 /*
- * nc_model : model-independent class queries
+ * nc_class : model-independent class queries
  *
  * Class index order differs per model ini
  *   (e.g. coco: per,bik,car,... / ncdl: per,car,bus,...),
@@ -21,13 +21,13 @@ extern "C" {
 
 /* 1 if class_id of net_id is a vehicle (trajectory target), else 0.
  * Returns 0 for invalid net_id / class_id or not-loaded network. */
-int nc_model_is_vehicle(E_NETWORK_UID net_id, int class_id);
+int nc_class_is_vehicle(E_NETWORK_UID net_id, int class_id);
 
 /* drop cached class tables (call after network ini is reloaded) */
-void nc_model_reset(void);
+void nc_class_reset(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* NC_MODEL_H */
+#endif /* NC_CLASS_H */
