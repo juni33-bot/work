@@ -19,7 +19,7 @@
  *   nc_minimap_add_obj(ch, &obj);            // for each vehicle bbox
  *   nc_minimap_draw(ch, viewport, &res);     // after the camera overlays
  *
- * Forward distance depends on NC_LDW_DEFAULT_HFOV_DEG (see nc_ldw.h).
+ * Forward distance depends on NC_LDW_DEFAULT_FOCAL_PX / LDW_FOCAL_PX (see nc_ldw.h).
  */
 
 #include <stdint.h>
@@ -35,6 +35,19 @@
 #define NC_MINIMAP_RANGE_HYST_M (2.0f)    // appear at <= RANGE-HYST, disappear above RANGE (never drawn beyond RANGE)
 #define NC_MINIMAP_LAT_RANGE_M  (9.0f)    // lateral range each side (m): ego lane + 2 lanes
 #define NC_MINIMAP_BG_ALPHA     (0.92f)   // panel background opacity
+
+/* Camera pitch compensation (road bumps). All box bottoms jump up/down together
+ * when the car pitches while the lane horizon does not follow, so every vehicle
+ * moves closer/farther at once. Per displayed frame the median bottom move of
+ * the vehicles (>= MIN_VEH, outliers > OUTLIER_PX dropped) is accumulated into a
+ * pitch offset that decays with TAU_S and is clamped to MAX_PX; the minimap uses
+ * bottom - offset. Board log 11-05: 0.3 s common distance change p90 19% -> 10%.
+ * 0: off (positions as before). */
+#define NC_MINIMAP_PITCH_COMP        (1)
+#define NC_MINIMAP_PITCH_TAU_S       (0.6f)
+#define NC_MINIMAP_PITCH_MAX_PX      (15.0f)
+#define NC_MINIMAP_PITCH_OUTLIER_PX  (25.0f)
+#define NC_MINIMAP_PITCH_MIN_VEH     (2)
 
 /* 1: lane line style from the UFLD lane_class output (1 = solid, 2 = dashed per
  *    the ini comment; mapping not verified on the board yet)

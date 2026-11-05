@@ -84,13 +84,17 @@ typedef struct {
     float     color[MM_CLS_N][4];
     int       has_color[MM_CLS_N];
     int       highlight;
+    float     v_prev;           // raw box bottom (px) of the last update (pitch estimate)
+    uint64_t  v_prev_us;        // displayed frame of v_prev
 } stMmTrack;
 
 typedef struct {
     stNcMinimapObj in;
     int    ok;                  // road position available
     int    cls;
-    float  xm, zm;              // road position of the drawn box bottom-centre
+    float  xm, zm;              // road position of the drawn box bottom-centre (pitch compensated)
+    float  u, v_raw, v_used;    // box bottom-centre (px): raw / after pitch compensation
+    stNcLdwGeom geom;           // geometry used for the road position
     float  vp_used;
     uint64_t geom_t_us;
     int    track;               // index into tracks, -1 = none
@@ -102,6 +106,9 @@ typedef struct {
     stMmObs   obs[MM_MAX_OBS];
     uint32_t  next_id;
     stMmTrack track[MM_MAX_TRACK];
+    uint64_t  prev_disp_us;     // previous displayed frame
+    float     pitch_px;         // pitch offset of the box bottoms (px, + = down)
+    uint64_t  pitch_us;         // displayed frame of pitch_px
 } stMmChannel;
 
 static stMmChannel  g_mm[NC_LDW_MAX_CH];    // render thread only
@@ -203,6 +210,8 @@ static void mm_smooth(stMmTrack *t, const stMmObs *o, uint64_t now)
         t->n_upd++;
     }
     t->last_upd_disp_us = now;
+    t->v_prev = o->v_raw;
+    t->v_prev_us = now;
     mm_vote(t, o, 1.0f);
 }
 
@@ -228,14 +237,60 @@ void nc_minimap_add_obj(uint32_t ch, const stNcMinimapObj *in)
     o->cls = mm_class_of(in->class_name);
     o->track = -1;
 
-    // ground contact point of the drawn box with the newest (calibrated) geometry
-    stNcLdwGeom g;
-    float u = in->shown.x + in->shown.w * 0.5f, v = in->shown.y + in->shown.h;
-    if (nc_ldw_app_get_geom(ch, 0, &g) >= 0 &&
-        nc_ldw_geom_to_road(ch, &g, u, v, &o->xm, &o->zm) == 0 && o->zm > 0.0f) {
+    // ground contact point of the drawn box with the newest (calibrated) geometry.
+    // Road position is computed in mm_process() after the pitch compensation.
+    o->u = in->shown.x + in->shown.w * 0.5f;
+    o->v_raw = o->v_used = in->shown.y + in->shown.h;
+    if (nc_ldw_app_get_geom(ch, 0, &o->geom) >= 0) {
         o->ok = 1;
-        o->vp_used = g.vp_y;
-        o->geom_t_us = g.t_us;
+        o->vp_used = o->geom.vp_y;
+        o->geom_t_us = o->geom.t_us;
+    }
+}
+
+/* pitch offset from the common bottom move of the known vehicles, then the road
+ * position of every detection with bottom - offset */
+static void mm_pitch_and_road(uint32_t ch)
+{
+    stMmChannel *c = &g_mm[ch];
+    const uint64_t now = c->t_disp_us;
+
+#if NC_MINIMAP_PITCH_COMP
+    if (now != c->pitch_us) {
+        float d[MM_MAX_OBS];
+        int nd = 0;
+        for (int n = 0; n < c->obs_cnt; n++) {
+            const stMmObs *o = &c->obs[n];
+            if (!o->ok) continue;
+            const stMmTrack *t = mm_find_alias(c, o->in.class_name, o->in.track_id);
+            if (t == NULL || t->v_prev_us == 0 || t->v_prev_us != c->prev_disp_us) continue;
+            float dv = o->v_raw - t->v_prev;
+            if (fabsf(dv) > NC_MINIMAP_PITCH_OUTLIER_PX) continue;      // re-association / jump
+            int k = nd++;                                              // insertion sort
+            while (k > 0 && d[k - 1] > dv) { d[k] = d[k - 1]; k--; }
+            d[k] = dv;
+        }
+        if (c->pitch_us == 0 || now < c->pitch_us || now - c->pitch_us > MM_TRACK_GAP_US) {
+            c->pitch_px = 0.0f;                                        // long gap: start again
+        } else {
+            float dt = (float)(now - c->pitch_us) * 1e-6f;
+            c->pitch_px *= expf(-dt / NC_MINIMAP_PITCH_TAU_S);
+            if (nd >= NC_MINIMAP_PITCH_MIN_VEH)
+                c->pitch_px += (nd % 2) ? d[nd / 2] : 0.5f * (d[nd / 2 - 1] + d[nd / 2]);
+            c->pitch_px = fmaxf(-NC_MINIMAP_PITCH_MAX_PX, fminf(NC_MINIMAP_PITCH_MAX_PX, c->pitch_px));
+        }
+        c->pitch_us = now;
+    }
+#endif
+
+    for (int n = 0; n < c->obs_cnt; n++) {
+        stMmObs *o = &c->obs[n];
+        if (!o->ok) continue;
+#if NC_MINIMAP_PITCH_COMP
+        o->v_used = o->v_raw - c->pitch_px;
+#endif
+        if (nc_ldw_geom_to_road(ch, &o->geom, o->u, o->v_used, &o->xm, &o->zm) != 0 || o->zm <= 0.0f)
+            o->ok = 0;
     }
 }
 
@@ -251,6 +306,8 @@ static void mm_process(uint32_t ch)
         t->highlight = 0;
         if (now > t->last_seen_disp_us && now - t->last_seen_disp_us > MM_DROP_US) t->used = 0;
     }
+
+    mm_pitch_and_road(ch);
 
     // 1. known (class, tracker id)
     for (int n = 0; n < c->obs_cnt; n++) {
@@ -316,6 +373,7 @@ static void mm_process(uint32_t ch)
         if (!t->in_range && t->z <= NC_MINIMAP_RANGE_M - NC_MINIMAP_RANGE_HYST_M) t->in_range = 1;
         else if (t->in_range && t->z > NC_MINIMAP_RANGE_M) t->in_range = 0;
     }
+    c->prev_disp_us = now;
 }
 
 static int mm_track_drawn(const stMmChannel *c, const stMmTrack *t)
@@ -346,7 +404,7 @@ static void mm_log(uint32_t ch)
                       (double)o->in.meas.x, (double)o->in.meas.y, (double)o->in.meas.w, (double)o->in.meas.h,
                       o->in.pred_valid,
                       (double)o->in.shown.x, (double)o->in.shown.y, (double)o->in.shown.w, (double)o->in.shown.h,
-                      (double)(o->in.shown.x + o->in.shown.w * 0.5f), (double)(o->in.shown.y + o->in.shown.h),
+                      (double)o->u, (double)o->v_used,          // v_used: after pitch compensation
                       (double)vp, (double)k,
                       (double)o->xm, (double)(o->ok ? o->zm : 0.0f),
                       (double)(t ? t->x : 0.0f), (double)(t ? t->z : 0.0f),
