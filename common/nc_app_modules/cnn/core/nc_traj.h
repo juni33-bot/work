@@ -18,7 +18,7 @@
  * class, so track_id is unique only within a class.
  *
  * Kalman state [cx, cy, vx, vy] (px, px/s), variable dt from frame
- * timestamps. Box size = last measured w/h. All times are monotonic us
+ * timestamps. Box size w/h has its own CV filter (no raw h in the bottom). All times are monotonic us
  * (same clock as cnn_output->time_stamp_us).
  */
 
