@@ -30,10 +30,15 @@ extern const stNcLdwEgoLane NC_LDW_EGO_LANE;
 
 #define NC_LDW_DEFAULT_LANE_WIDTH_M     (3.5f)
 
-/* Horizontal field of view used for the default focal length (dashcam ~100-120 deg).
- * Only forward distance (z_m) depends on it; a wrong value scales all z_m by the
- * same factor. Tune with dashed lane lines (highway: 10 m line + 10 m gap). */
-#define NC_LDW_DEFAULT_HFOV_DEG         (110.0f)
+/* Focal length in canvas px, used only for forward distance z_m = focal_px * W / w(y).
+ * Lateral distances need nothing but the lane width (pixels only, no FOV).
+ * There is no field-of-view assumption: measure it from the video with a known
+ * road length along the lane (dashed-line period L m, start rows v1 far, v2 near):
+ *     focal_px = L / (W / w(v1) - W / w(v2)),   w(v) = k * (v - vp_y)
+ * A wrong value scales every z_m by the same factor. <= 0: z_m is not computed.
+ * 672 px = previous default (kept until the measured value is set).
+ * Override without a rebuild: LDW_FOCAL_PX=<px> ./run_app_wayland_npu.sh */
+#define NC_LDW_DEFAULT_FOCAL_PX         (672.0f)
 
 typedef enum {
     NC_LDW_STATE_INVALID = 0,   // ego lane not available
@@ -41,6 +46,12 @@ typedef enum {
     NC_LDW_STATE_WARN_LEFT,     // departing over the left line
     NC_LDW_STATE_WARN_RIGHT     // departing over the right line
 } eNcLdwState;
+
+typedef enum {
+    NC_LDW_LEVEL_NONE = 0,      // no warning
+    NC_LDW_LEVEL_WEAK,          // crossing a dashed line (lane change allowed): weak alert
+    NC_LDW_LEVEL_STRONG         // crossing a solid / unknown line: strong warning
+} eNcLdwLevel;
 
 typedef struct {
     float img_w;                // canvas width of the lane points (px)
@@ -62,6 +73,7 @@ typedef struct {
     float tlc_margin_s;         // extra safety margin
     float tlc_max_dist_m;       // TLC warning only when closer than this
     float min_lat_vel_mps;      // lateral speed needed for a TLC warning
+    int   dashed_class;         // lane_class value of a dashed line (weak alert)
     int   trigger_frames;       // consecutive frames needed to raise a warning
     float hold_s;               // keep the warning at least this long
     float lost_timeout_s;       // lanes missing longer than this -> INVALID
@@ -69,7 +81,10 @@ typedef struct {
 
 typedef struct {
     eNcLdwState state;
+    eNcLdwLevel level;          // strength of the current warning
     int   valid;                // 1: ego lane geometry available
+    int   left_class;           // lane_class of the left / right line (-1: not detected)
+    int   right_class;
     int   left_detected;        // 1: left line detected, 0: inferred from width
     int   right_detected;
 
@@ -106,7 +121,6 @@ typedef struct {
 
 
     // temporal state
-    uint32_t last_sig;
     int      has_last;
     float    last_offset_m;
     uint64_t last_update_us;
@@ -117,16 +131,18 @@ typedef struct {
     uint64_t warn_until_us;
     int      turn_left;
     int      turn_right;
+    float    dashed_score[2];   // left/right: share of recent frames seen as dashed (-1 = none yet)
 } stNcLdwContext;
 
 void nc_ldw_default_config(stNcLdwConfig *cfg, float img_w, float img_h);
 void nc_ldw_init(stNcLdwContext *ctx, const stNcLdwConfig *cfg);
 
-/* Lane departure calculation. Feed one lane result.
+/* Lane departure calculation. Feed one NEW lane result.
+ * lanes       : lane result, or NULL when there is no new result since the
+ *               last call (only the lost-lane timeout is checked)
  * data_time_us: capture time of the lane data (0 = unknown, now_us is used)
  * now_us      : current CLOCK_MONOTONIC time in us
- * Returns 1 when new lane data was processed, 0 when the data was the same
- * as last time (result kept). */
+ * Returns 1 when lane data was processed, 0 for lanes == NULL. */
 int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
                   uint64_t data_time_us, uint64_t now_us);
 
@@ -223,7 +239,7 @@ float nc_ldw_app_focal_px(uint32_t ch);
 /*
  * Road-plane position of canvas pixel (u, v) with the newest lane frame geometry. Thread-safe.
  * x_m: lateral distance from vehicle centre (+: right).
- * z_m: forward distance from the camera (from NC_LDW_DEFAULT_HFOV_DEG).
+ * z_m: forward distance from the camera (from cfg.focal_px, -1 if <= 0).
  * Either pointer may be NULL.
  * Returns 0 on success, -1 if not calibrated yet or v is at/above the horizon.
  * Works with the last calibration even while lanes are briefly lost.

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -7,8 +8,9 @@
 #include "nc_ldw.h"
 
 /*
- * Shared functions from teammates (not merged yet). When their files are in
- * the build, uncomment the includes below and every line marked "// [TEAM]".
+ * Shared functions from teammates (not merged yet). When their files (or
+ * nc_c_stub.c) are in the build, uncomment the includes below and every line
+ * marked "// [TEAM]".
  *   nc_meas_get_latency_ms() : capture -> NPU result latency (ms)
  *   nc_rec_trigger(type)     : start recording, 0 = lane departure
  *   nc_model_get_mode()      : MODE_NORMAL / MODE_LIGHT / MODE_SKIP
@@ -21,7 +23,7 @@
 
 /* Print lane_class of every lane once a second (to confirm 0/1/2 meaning
  * on the board). Set to 0 when done. */
-#define NC_LDW_LOG_LANE_CLASS       (1)
+#define NC_LDW_LOG_LANE_CLASS       (0)
 
 const stNcLdwEgoLane NC_LDW_EGO_LANE = {
     NC_LDW_LEFT_EGO_LANE_BOUNDARY_INDEX,
@@ -35,6 +37,7 @@ const stNcLdwEgoLane NC_LDW_EGO_LANE = {
 #define LDW_CALIB_ALPHA             (0.10f)   // EMA weight for k / vp_y
 #define LDW_VEL_ALPHA               (0.30f)   // EMA weight for lateral velocity
 #define LDW_MAX_DT_S                (1.0f)
+#define LDW_CLASS_ALPHA             (0.15f)   // EMA weight for the dashed/solid vote (~0.5 s)
 
 
 static float us_to_s(uint64_t us)
@@ -45,28 +48,6 @@ static float us_to_s(uint64_t us)
 static uint64_t s_to_us(float s)
 {
     return (uint64_t)((double)s * 1000000.0);
-}
-
-/* FNV-1a over the ego-lane points, used to skip repeated (unchanged) results. */
-static uint32_t lane_signature(const stLaneDet *lanes, int lane_num)
-{
-    uint32_t h = 2166136261u;
-    const int idx[2] = { NC_LDW_LEFT_EGO_LANE_BOUNDARY_INDEX, NC_LDW_RIGHT_EGO_LANE_BOUNDARY_INDEX };
-
-    for (int i = 0; i < 2; i++) {
-        if (idx[i] >= lane_num) continue;
-        const stLaneDet *ln = &lanes[idx[i]];
-        int cnt = ln->point_cnt;
-        if (cnt < 0) cnt = 0;
-        if (cnt > MAX_POINT_CNT_OF_LANE) cnt = MAX_POINT_CNT_OF_LANE;
-
-        const unsigned char *p = (const unsigned char *)&cnt;
-        for (size_t j = 0; j < sizeof(cnt); j++) { h ^= p[j]; h *= 16777619u; }
-
-        p = (const unsigned char *)ln->point;
-        for (size_t j = 0; j < (size_t)cnt * sizeof(stPoint); j++) { h ^= p[j]; h *= 16777619u; }
-    }
-    return h;
 }
 
 /* Least-squares fit x = a*y + b using points with y_min <= y <= y_max. */
@@ -110,6 +91,16 @@ static int fit_lane_line(const stLaneDet *ln, float y_min, float y_max, float ma
     return 0;
 }
 
+/* side 0 = left, 1 = right. Unknown class (-1) keeps the previous vote. */
+static void ldw_vote_dashed(stNcLdwContext *ctx, int side, int lane_class)
+{
+    float *v = &ctx->dashed_score[side];
+    if (lane_class < 0) return;
+    float d = lane_class == ctx->cfg.dashed_class ? 1.0f : 0.0f;
+    if (*v < 0.0f) *v = d;
+    else           *v += LDW_CLASS_ALPHA * (d - *v);
+}
+
 void nc_ldw_default_config(stNcLdwConfig *cfg, float img_w, float img_h)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -121,12 +112,13 @@ void nc_ldw_default_config(stNcLdwConfig *cfg, float img_w, float img_h)
     cfg->cam_offset_m    = 0.0f;
     cfg->ref_y_px        = img_h * 0.80f;
     cfg->fit_y_min_px    = img_h * 0.55f;
-    cfg->focal_px        = (img_w * 0.5f) / tanf(NC_LDW_DEFAULT_HFOV_DEG * 0.5f * 3.14159265f / 180.0f);
-    cfg->warn_margin_m   = 0.30f;
-    cfg->reaction_time_s = 0.8f;    // TLC threshold = 0.8 + latency + 0.2
-    cfg->tlc_margin_s    = 0.2f;
-    cfg->tlc_max_dist_m  = 1.0f;
-    cfg->min_lat_vel_mps = 0.15f;
+    cfg->focal_px        = NC_LDW_DEFAULT_FOCAL_PX;   // forward distance only (LDW_FOCAL_PX to override)
+    cfg->warn_margin_m   = 0.50f;   // warn when the car edge is closer than this to a line
+    cfg->reaction_time_s = 0.8f;    // TLC threshold = 0.8 + latency + 0.7
+    cfg->tlc_margin_s    = 0.7f;
+    cfg->tlc_max_dist_m  = 1.5f;
+    cfg->min_lat_vel_mps = 0.10f;
+    cfg->dashed_class    = 2;       // ufld: 0 = none, 1 = solid, 2 = dashed (confirmed on board 11/05)
     cfg->trigger_frames  = 2;
     cfg->hold_s          = 1.0f;
     cfg->lost_timeout_s  = 0.5f;
@@ -138,6 +130,8 @@ void nc_ldw_init(stNcLdwContext *ctx, const stNcLdwConfig *cfg)
     ctx->cfg = *cfg;
     ctx->res.state = NC_LDW_STATE_INVALID;
     ctx->res.tlc_s = -1.0f;
+    ctx->dashed_score[0] = -1.0f;
+    ctx->dashed_score[1] = -1.0f;
 }
 
 void nc_ldw_set_turn_signal(stNcLdwContext *ctx, int left_on, int right_on)
@@ -162,6 +156,7 @@ static void ldw_check_lost(stNcLdwContext *ctx, uint64_t now_us)
     if (now_us > ctx->last_wall_us &&
         us_to_s(now_us - ctx->last_wall_us) > ctx->cfg.lost_timeout_s) {
         ctx->res.state = NC_LDW_STATE_INVALID;
+        ctx->res.level = NC_LDW_LEVEL_NONE;
         ctx->res.valid = 0;
         ldw_reset_tracking(ctx);
     }
@@ -170,6 +165,7 @@ static void ldw_check_lost(stNcLdwContext *ctx, uint64_t now_us)
 void nc_ldw_suspend(stNcLdwContext *ctx)
 {
     ctx->res.state = NC_LDW_STATE_INVALID;
+    ctx->res.level = NC_LDW_LEVEL_NONE;
     ctx->res.valid = 0;
     ldw_reset_tracking(ctx);
 }
@@ -205,25 +201,58 @@ int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
     int left_ok = 0, right_ok = 0;
     const uint64_t t = data_time_us ? data_time_us : now_us;   // time of this lane data
 
-    if (lanes == NULL) lane_num = 0;
-
-    uint32_t sig = lane_signature(lanes, lane_num);
-    if (ctx->last_update_us != 0 && sig == ctx->last_sig) {
+    /* NULL = no new lane result since the last call: only check the timeout.
+     * (Identical points are still a new result: UFLD x is quantised, so a
+     *  steady drive often gives exactly the same points twice.) */
+    if (lanes == NULL) {
         ldw_check_lost(ctx, now_us);
         return 0;
     }
-    ctx->last_sig = sig;
     ctx->last_update_us = now_us;
 
     float max_rms = c->img_w * LDW_MAX_FIT_RMS_RATIO;
-    const int li = (int)NC_LDW_EGO_LANE.left_boundary_index;
-    const int ri = (int)NC_LDW_EGO_LANE.right_boundary_index;
-    if (lane_num > li)
-        left_ok = fit_lane_line(&lanes[li], c->fit_y_min_px, c->img_h, max_rms, &aL, &bL) == 0;
-    if (lane_num > ri)
-        right_ok = fit_lane_line(&lanes[ri], c->fit_y_min_px, c->img_h, max_rms, &aR, &bR) == 0;
-
     float y = c->ref_y_px;
+
+    /* Ego-lane boundaries are lane slots 1 and 2, but left/right is decided by
+     * position, not by slot number: the line with the smaller x on the
+     * reference row is the left one. A single line is left when it is left
+     * of the camera column. */
+    {
+        const int slot[2] = { (int)NC_LDW_EGO_LANE.left_boundary_index,
+                              (int)NC_LDW_EGO_LANE.right_boundary_index };
+        int   ok[2] = {0, 0}, cls[2] = {-1, -1};
+        float fa[2] = {0.0f, 0.0f}, fb[2] = {0.0f, 0.0f};
+
+        for (int i = 0; i < 2; i++) {
+            if (lane_num > slot[i] &&
+                fit_lane_line(&lanes[slot[i]], c->fit_y_min_px, c->img_h, max_rms, &fa[i], &fb[i]) == 0) {
+                ok[i] = 1;
+                cls[i] = lanes[slot[i]].lane_class;
+            }
+        }
+
+        int l = -1, rgt = -1;     // index (0/1) of the left / right line
+        if (ok[0] && ok[1]) {
+            int first_is_left = (fa[0] * y + fb[0]) <= (fa[1] * y + fb[1]);
+            l   = first_is_left ? 0 : 1;
+            rgt = first_is_left ? 1 : 0;
+        } else if (ok[0] || ok[1]) {
+            int i = ok[0] ? 0 : 1;
+            if (fa[i] * y + fb[i] < c->cam_x_px) l = i;
+            else                                  rgt = i;
+        }
+
+        if (l >= 0)   { left_ok = 1;  aL = fa[l];   bL = fb[l]; }
+        if (rgt >= 0) { right_ok = 1; aR = fa[rgt]; bR = fb[rgt]; }
+        r->left_class  = l >= 0 ? cls[l] : -1;
+        r->right_class = rgt >= 0 ? cls[rgt] : -1;
+    }
+
+    /* lane_class flickers between solid and dashed on the same line, so the
+     * warning level uses a vote over recent frames, not the current frame. */
+    ldw_vote_dashed(ctx, 0, r->left_class);
+    ldw_vote_dashed(ctx, 1, r->right_class);
+
     float xl = aL * y + bL;
     float xr = aR * y + bR;
 
@@ -291,6 +320,8 @@ int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
             ctx->left_cnt = 0;
             ctx->right_cnt = 0;
             ctx->warn_until_us = 0;
+            ctx->dashed_score[0] = -1.0f;   // the lines changed sides
+            ctx->dashed_score[1] = -1.0f;
         }
         r->lat_vel_mps += LDW_VEL_ALPHA * (d / dt - r->lat_vel_mps);
     } else {
@@ -364,6 +395,15 @@ int nc_ldw_update(stNcLdwContext *ctx, const stLaneDet *lanes, int lane_num,
     }
     r->state = next;
 
+    /* Strength: crossing a dashed line is allowed (lane change) -> weak alert,
+     * solid or unknown line -> strong warning. */
+    if (next == NC_LDW_STATE_WARN_LEFT)
+        r->level = ctx->dashed_score[0] >= 0.5f ? NC_LDW_LEVEL_WEAK : NC_LDW_LEVEL_STRONG;
+    else if (next == NC_LDW_STATE_WARN_RIGHT)
+        r->level = ctx->dashed_score[1] >= 0.5f ? NC_LDW_LEVEL_WEAK : NC_LDW_LEVEL_STRONG;
+    else
+        r->level = NC_LDW_LEVEL_NONE;
+
     return 1;
 }
 
@@ -405,6 +445,12 @@ static int g_ldw_ch_num = 0;
 static float g_ldw_canvas_w = 0.0f;
 static float g_ldw_canvas_h = 0.0f;
 static int g_ldw_suspended[NC_LDW_MAX_CH];
+
+/* New-result detection: the lane result buffer is a flip-flop (2 buffers),
+ * so a new result moves the readable pointer. The timestamp also changes once
+ * the input timestamp is passed through. */
+static const void *g_ldw_last_buf[NC_LDW_MAX_CH];
+static uint64_t g_ldw_last_ts[NC_LDW_MAX_CH];
 
 /* Ego-lane snapshot shared with other threads (cut-in prediction). */
 typedef struct {
@@ -526,6 +572,42 @@ static void ldw_log_lane_class(uint32_t ch, const pp_result_buf *lane_buf, uint6
 }
 #endif
 
+/* Board tuning without a rebuild: environment variables override the
+ * defaults, e.g.  LDW_WARN_MARGIN=0.6 ./run_app_wayland_npu.sh  */
+static void ldw_env_float(const char *name, float *v)
+{
+    const char *e = getenv(name);
+    char *end = NULL;
+    if (!e || !*e) return;
+    float f = strtof(e, &end);
+    if (end != e) *v = f;
+    else printf("[LDW] ignoring %s=%s (not a number)\n", name, e);
+}
+
+static void ldw_env_int(const char *name, int *v)
+{
+    float f = (float)*v;
+    ldw_env_float(name, &f);
+    *v = (int)lroundf(f);
+}
+
+static void ldw_config_from_env(stNcLdwConfig *cfg)
+{
+    ldw_env_float("LDW_WARN_MARGIN",  &cfg->warn_margin_m);
+    ldw_env_float("LDW_REACTION",     &cfg->reaction_time_s);
+    ldw_env_float("LDW_TLC_MARGIN",   &cfg->tlc_margin_s);
+    ldw_env_float("LDW_TLC_MAX_DIST", &cfg->tlc_max_dist_m);
+    ldw_env_float("LDW_MIN_VEL",      &cfg->min_lat_vel_mps);
+    ldw_env_float("LDW_VEHICLE_WIDTH",&cfg->vehicle_width_m);
+    ldw_env_float("LDW_FOCAL_PX",     &cfg->focal_px);
+    ldw_env_float("LDW_REF_Y",        &cfg->ref_y_px);
+    ldw_env_float("LDW_CAM_X",        &cfg->cam_x_px);
+    ldw_env_float("LDW_HOLD",         &cfg->hold_s);
+    ldw_env_int  ("LDW_TRIGGER_FRAMES", &cfg->trigger_frames);
+    ldw_env_int  ("LDW_DASHED_CLASS",   &cfg->dashed_class);
+    if (cfg->trigger_frames < 1) cfg->trigger_frames = 1;
+}
+
 void nc_ldw_app_init(int ch_num, float canvas_w, float canvas_h)
 {
     stNcLdwConfig cfg;
@@ -537,16 +619,24 @@ void nc_ldw_app_init(int ch_num, float canvas_w, float canvas_h)
     g_ldw_canvas_h = canvas_h;
 
     nc_ldw_default_config(&cfg, canvas_w, canvas_h);
+    ldw_config_from_env(&cfg);
+    printf("[LDW] config: warn_margin=%.2fm tlc<%.2f+lat+%.2fs (dist<%.2fm, vel>%.2fm/s) "
+           "trigger=%d frames ref_y=%.0f cam_x=%.0f dashed_class=%d focal=%.1fpx\n",
+           (double)cfg.warn_margin_m, (double)cfg.reaction_time_s, (double)cfg.tlc_margin_s,
+           (double)cfg.tlc_max_dist_m, (double)cfg.min_lat_vel_mps, cfg.trigger_frames,
+           (double)cfg.ref_y_px, (double)cfg.cam_x_px, cfg.dashed_class, (double)cfg.focal_px);
     for (int i = 0; i < ch_num; i++) {
         nc_ldw_init(&g_ldw_ctx[i], &cfg);
         g_ldw_suspended[i] = 0;
+        g_ldw_last_buf[i] = NULL;
+        g_ldw_last_ts[i] = 0;
     }
     /* constants needed to recompute road positions offline */
     nc_bevlog_row(NC_BEVLOG_LANE, "# cfg canvas_w=%.0f canvas_h=%.0f focal_px=%.3f lane_width_m=%.3f cam_x_px=%.2f "
-                  "cam_offset_m=%.3f ref_y_px=%.1f fit_y_min_px=%.1f hfov_deg=%.1f calib_alpha=%.3f",
+                  "cam_offset_m=%.3f ref_y_px=%.1f fit_y_min_px=%.1f calib_alpha=%.3f",
                   (double)canvas_w, (double)canvas_h, (double)cfg.focal_px, (double)cfg.lane_width_m,
                   (double)cfg.cam_x_px, (double)cfg.cam_offset_m, (double)cfg.ref_y_px,
-                  (double)cfg.fit_y_min_px, (double)NC_LDW_DEFAULT_HFOV_DEG, (double)LDW_CALIB_ALPHA);
+                  (double)cfg.fit_y_min_px, (double)LDW_CALIB_ALPHA);
 
     pthread_mutex_lock(&g_ldw_ego_lock);
     memset(g_ldw_ego, 0, sizeof(g_ldw_ego));
@@ -576,13 +666,18 @@ void nc_ldw_app_process(uint32_t ch, const pp_result_buf *lane_buf)
     }
     if (g_ldw_suspended[ch]) {
         /* back from SKIP: the buffer may still hold the lane result from before
-         * SKIP; it has the same signature, so it is ignored until new data comes */
+         * SKIP; its pointer was already seen, so it is ignored until new data comes */
         g_ldw_suspended[ch] = 0;
         printf("[LDW] ch%u resumed\n", ch);
     }
 
-    int new_data;
-    if (lane_buf) {
+    int new_data = 0;
+    int is_new = lane_buf != NULL &&
+                 ((const void *)lane_buf != g_ldw_last_buf[ch] || lane_buf->time_stamp != g_ldw_last_ts[ch]);
+
+    if (is_new) {
+        g_ldw_last_buf[ch] = lane_buf;
+        g_ldw_last_ts[ch] = lane_buf->time_stamp;
 #if NC_LDW_LOG_LANE_CLASS
         ldw_log_lane_class(ch, lane_buf, now_us);
 #endif
@@ -590,7 +685,7 @@ void nc_ldw_app_process(uint32_t ch, const pp_result_buf *lane_buf)
         new_data = nc_ldw_update(ctx, lane_buf->cnn_result.lane_det, lane_buf->lane_draw_info.max_lane_num,
                                  lane_buf->time_stamp, now_us);
     } else {
-        new_data = nc_ldw_update(ctx, NULL, 0, 0, now_us);
+        nc_ldw_update(ctx, NULL, 0, 0, now_us);    // no new result: timeout check only
     }
     ldw_publish_ego(ch, ctx);
     if (new_data) ldw_publish_geom(ch, ctx, lane_buf);
@@ -620,12 +715,14 @@ void nc_ldw_app_process(uint32_t ch, const pp_result_buf *lane_buf)
                       ldw_lane_class(lane_buf, 2), ldw_lane_class(lane_buf, 3));
     }
     if (r->state != prev) {
-        printf("[LDW] ch%u %s -> %s (left %.2fm, right %.2fm, offset %+.2fm, vel %+.2fm/s, "
-               "tlc %.2fs < %.2fs?, latency %.0fms)\n",
+        printf("[LDW] ch%u %s -> %s%s (left %.2fm, right %.2fm, offset %+.2fm, vel %+.2fm/s, "
+               "tlc %.2fs < %.2fs?, latency %.0fms, class L%d R%d, dashed vote L%.2f R%.2f)\n",
                ch, nc_ldw_state_name(prev), nc_ldw_state_name(r->state),
+               r->level == NC_LDW_LEVEL_WEAK ? "(weak)" : r->level == NC_LDW_LEVEL_STRONG ? "(strong)" : "",
                (double)r->dist_left_m, (double)r->dist_right_m, (double)r->offset_m,
                (double)r->lat_vel_mps, (double)r->tlc_s, (double)r->tlc_thresh_s,
-               (double)r->latency_ms);
+               (double)r->latency_ms, r->left_class, r->right_class,
+               (double)ctx->dashed_score[0], (double)ctx->dashed_score[1]);
     }
 }
 
@@ -785,18 +882,25 @@ void nc_ldw_app_draw(uint32_t ch, struct viewport vp, const stNcLdwDrawRes *res)
                         text_scale, info_color, sw, sh, *res->font_prog);
 
     if (warn) {
-        float red4[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-        float red3[3] = {1.0f, 0.0f, 0.0f};
+        /* strong (solid / unknown line): thick red frame
+         * weak   (dashed line)         : thin yellow frame */
+        int strong = (r->level != NC_LDW_LEVEL_WEAK);
+        float col4[4] = {1.0f, strong ? 0.0f : 0.85f, 0.0f, 1.0f};
+        float col3[3] = {col4[0], col4[1], col4[2]};
+        int frames = strong ? 4 : 2;
 
-        // red frame around the view
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < frames; i++) {
             float m = 4.0f + (float)i * 4.0f;
-            nc_opengl_draw_rectangle(m, m, cw - 2.0f * m, chh - 2.0f * m, red4, *res->npu_prog);
+            nc_opengl_draw_rectangle(m, m, cw - 2.0f * m, chh - 2.0f * m, col4, *res->npu_prog);
         }
 
-        const char *msg = (r->state == NC_LDW_STATE_WARN_LEFT) ? "<<< LANE DEPARTURE LEFT" : "LANE DEPARTURE RIGHT >>>";
+        const char *msg;
+        if (r->state == NC_LDW_STATE_WARN_LEFT)
+            msg = strong ? "<<< LANE DEPARTURE LEFT" : "<<< LEFT (dashed)";
+        else
+            msg = strong ? "LANE DEPARTURE RIGHT >>>" : "RIGHT (dashed) >>>";
         nc_opengl_draw_text(res->font_large, msg, cw * 0.5f - 300.0f, chh - 180.0f,
-                            text_scale, red3, sw, sh, *res->font_prog);
+                            text_scale, col3, sw, sh, *res->font_prog);
     }
 }
 
