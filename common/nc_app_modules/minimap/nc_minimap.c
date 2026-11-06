@@ -791,7 +791,6 @@ void nc_minimap_draw(uint32_t ch, struct viewport vp, const stNcMinimapDrawRes *
     stMmChannel *c = &g_mm[ch];
     const struct gl_npu_program *p = res->npu_prog;
     float text_scale = (float)VIEWPORT_HEIGHT / (float)vp.height * 0.8f;
-    char buf[32];
 
     mm_process(ch);
     mm_log(ch);
@@ -811,14 +810,12 @@ void nc_minimap_draw(uint32_t ch, struct viewport vp, const stNcMinimapDrawRes *
         return;
     }
 
-    // distance grid every 10 m (labels just below the line)
-    float grid_txt[3] = {0.75f, 0.75f, 0.75f};
+    // distance grid every 10 m. No labels: z uses the 672 px focal default and the
+    // measured value (about 1900 px) is not applied, so real distances are about 2.8x z.
     for (int d = 10; d <= (int)NC_MINIMAP_RANGE_M; d += 10) {
         float y = mm_py((float)d);
         float gcol[4] = {0.5f, 0.5f, 0.5f, 0.5f};
         nc_opengl_draw_line(k_px, y, k_px + k_pw, y, 1, gcol, *p);
-        snprintf(buf, sizeof(buf), "%dm", d);
-        mm_text(res, buf, k_px + 4.0f, y + 20.0f, text_scale, grid_txt);
     }
 
     stMmEgoFit ego_fit;
