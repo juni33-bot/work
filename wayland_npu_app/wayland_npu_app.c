@@ -172,44 +172,74 @@ st_nc_v4l2_config v4l2_config[VIDEO_MAX_CH];
 #endif
 /*
  * File input mode: decode a video file with ffmpeg (popen) instead of the camera.
- * ffmpeg outputs interleaved RGB24 at NPU input resolution, paced at real time (-re),
- * looping forever (-stream_loop -1). Only the first video stream is decoded
- * (audio / metadata tracks of phone .mov files can stop -stream_loop in ffmpeg 4.x).
- * If the stream still ends, ffmpeg is restarted so the video plays from the start again.
+ * ffmpeg outputs interleaved RGB24 at NPU input resolution, paced at real time (-re).
+ * Only the first video stream is decoded.
+ * Default: the videos in g_file_input_default_videos play in order, then repeat. Each video
+ * gets its own ffmpeg, started when the previous one ends. Missing files are skipped.
+ * "-i <file>": that one video loops forever (-stream_loop -1). Audio / metadata tracks of
+ * phone .mov files can stop -stream_loop in ffmpeg 4.x, so if the stream still ends,
+ * ffmpeg is restarted and the video plays from the start again.
  * The pipe fd is stored in video_fd so that existing "video_fd != -1" checks keep working.
  */
 #define FILE_INPUT_FFMPEG_PATH      "misc/ffmpeg"
-#define FILE_INPUT_DEFAULT_VIDEO    "misc/image_npu/1920_1080_0001.mp4"
 #define FILE_INPUT_FRAME_SIZE       (NPU_INPUT_WIDTH * NPU_INPUT_HEIGHT * 3)
 
-static const char *g_file_input_path = NULL;    // set by "-i <file>", NULL -> default
+#define FILE_INPUT_PATH_MAX         (256)
+
+static const char *const g_file_input_default_videos[] = {
+    "misc/image_npu/1920_1080_0001.mp4",
+    "misc/image_npu/1920_1080_0002.mp4",
+    "misc/image_npu/1920_1080_0003.mp4",
+};
+#define FILE_INPUT_MAX_VIDEOS       (sizeof(g_file_input_default_videos) / sizeof(g_file_input_default_videos[0]))
+
+static const char *g_file_input_path = NULL;    // set by "-i <file>", NULL -> default list
+static char g_file_input_videos[FILE_INPUT_MAX_VIDEOS][FILE_INPUT_PATH_MAX];
+static int g_file_input_video_cnt = 0;
+static int g_file_input_video_idx[VIDEO_MAX_CH];           // video now playing on each channel
+static char g_file_input_ffmpeg[FILE_INPUT_PATH_MAX];
 static FILE *g_file_input_fp[VIDEO_MAX_CH];
 static unsigned char *g_file_input_frame[VIDEO_MAX_CH];   // interleaved RGB24
-static char g_file_input_cmd[1024];                        // ffmpeg command (for restart)
 #define FILE_INPUT_MAX_RESTART      (3)    // consecutive restarts without a frame -> give up
+
+static void file_input_add_video(const char *path)
+{
+    if (access(path, R_OK) != 0) {
+        printf("[error] input video file not found: %s\n", path);
+        return;
+    }
+    snprintf(g_file_input_videos[g_file_input_video_cnt++], FILE_INPUT_PATH_MAX, "%s", path);
+}
+
+// start ffmpeg on the channel's current video. returns NULL on failure
+static FILE *file_input_open(int ch)
+{
+    char cmd[1024];
+    const char *video = g_file_input_videos[g_file_input_video_idx[ch]];
+
+    snprintf(cmd, sizeof(cmd),
+             "%s -loglevel error -nostdin %s-re -i \"%s\" "
+             "-map 0:v:0 -an -vf scale=%d:%d -pix_fmt rgb24 -f rawvideo -",
+             g_file_input_ffmpeg, (g_file_input_video_cnt == 1) ? "-stream_loop -1 " : "",
+             video, NPU_INPUT_WIDTH, NPU_INPUT_HEIGHT);
+    printf("[file input] ch%d : %s\n", ch, cmd);
+    return popen(cmd, "r");
+}
 
 static int file_input_initialize(void)
 {
-    char ffmpeg_path[256];
-    char video_path[256];
-    char *cmd = g_file_input_cmd;
-
-    snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", nc_localize_path(FILE_INPUT_FFMPEG_PATH));
+    snprintf(g_file_input_ffmpeg, sizeof(g_file_input_ffmpeg), "%s", nc_localize_path(FILE_INPUT_FFMPEG_PATH));
     if (g_file_input_path) {
-        snprintf(video_path, sizeof(video_path), "%s", g_file_input_path);
+        file_input_add_video(g_file_input_path);
     } else {
-        snprintf(video_path, sizeof(video_path), "%s", nc_localize_path(FILE_INPUT_DEFAULT_VIDEO));
+        for (size_t i = 0; i < FILE_INPUT_MAX_VIDEOS; i++) {
+            file_input_add_video(nc_localize_path(g_file_input_default_videos[i]));
+        }
     }
 
-    if (access(video_path, R_OK) != 0) {
-        printf("[error] input video file not found: %s\n", video_path);
+    if (g_file_input_video_cnt == 0) {
         return -1;
     }
-
-    snprintf(cmd, sizeof(g_file_input_cmd),
-             "%s -loglevel error -nostdin -stream_loop -1 -re -i \"%s\" "
-             "-map 0:v:0 -an -vf scale=%d:%d -pix_fmt rgb24 -f rawvideo -",
-             ffmpeg_path, video_path, NPU_INPUT_WIDTH, NPU_INPUT_HEIGHT);
 
     for (int i = 0; i < VIDEO_MAX_CH; i++) {
         g_file_input_frame[i] = (unsigned char *)malloc(FILE_INPUT_FRAME_SIZE);
@@ -218,8 +248,7 @@ static int file_input_initialize(void)
             return -1;
         }
 
-        printf("[file input] ch%d : %s\n", i, cmd);
-        g_file_input_fp[i] = popen(cmd, "r");
+        g_file_input_fp[i] = file_input_open(i);
         if (g_file_input_fp[i] == NULL) {
             perror("[error] popen(ffmpeg) failure");
             return -1;
@@ -239,17 +268,17 @@ static int file_input_read_frame(int ch)
     while (total < FILE_INPUT_FRAME_SIZE) {
         size_t n = fread(g_file_input_frame[ch] + total, 1, FILE_INPUT_FRAME_SIZE - total, g_file_input_fp[ch]);
         if (n == 0) {
-            // stream ended (loop failed): restart ffmpeg from the beginning
+            // stream ended: go to the next video (single video: restart it)
             pclose(g_file_input_fp[ch]);
             g_file_input_fp[ch] = NULL;
+            g_file_input_video_idx[ch] = (g_file_input_video_idx[ch] + 1) % g_file_input_video_cnt;
             if (restart_cnt[ch] >= FILE_INPUT_MAX_RESTART ||
-                (g_file_input_fp[ch] = popen(g_file_input_cmd, "r")) == NULL) {
+                (g_file_input_fp[ch] = file_input_open(ch)) == NULL) {
                 printf("[error] ffmpeg stream ended (ch%d). check ffmpeg / video file\n", ch);
                 v4l2_config[ch].video_buf.video_fd = -1;    // fall back to logo image
                 return -1;
             }
             restart_cnt[ch]++;
-            printf("[file input] ch%d : stream ended, restarting ffmpeg (%d)\n", ch, restart_cnt[ch]);
             v4l2_config[ch].video_buf.video_fd = fileno(g_file_input_fp[ch]);
             total = 0;                                  // drop the partial frame
             continue;
@@ -1267,7 +1296,7 @@ static void usage(int error_code)
         "  -f\tRun in fullscreen mode\n"
         "  -o\tCreate an opaque surface\n"
 #ifdef USE_FILE_INPUT
-        "  -i <file>\tInput video file (default: " FILE_INPUT_DEFAULT_VIDEO ")\n"
+        "  -i <file>\tLoop one video file (default: play misc/image_npu/1920_1080_000[1-3].mp4 in turn)\n"
 #endif
         "  -h\tThis help text\n\n");
 
