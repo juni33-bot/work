@@ -33,6 +33,33 @@
 #define MM_HOLD_US          (300000ULL) // keep drawing a vehicle this long after its last detection
 #define MM_DROP_US          (1000000ULL)// forget a track not detected this long
 
+/* Vehicle leaving through the side of the image: once the box touches the edge the rear
+ * is out of view and the box bottom moves to the front wheels, so z stalls and x bends
+ * inwards (0001: about 1 s at z = 2.2). The measurement is dropped there and the vehicle
+ * goes on with the closing speed and x from before the edge, faded out, drawn dashed.
+ * Only for vehicles closing slower than V_MAX (faster ones are crossing or oncoming)
+ * and with an x that moved less than X_MAX. Speeds in minimap z units per second. */
+#define MM_COAST_HIST       (64)        // position history per track (1.5 s at up to 40 fps)
+#define MM_COAST_EDGE_PX    (20.0f)     // box this close to the image side: touching
+#define MM_COAST_CANCEL_PX  (60.0f)     // box this far inside again: measured position is back
+#define MM_COAST_MAX_Z_M    (12.0f)     // farther vehicles at the edge are not passing
+#define MM_COAST_V_MIN      (0.5f)
+#define MM_COAST_V_MAX      (6.0f)
+#define MM_COAST_X_MAX_M    (1.5f)
+#define MM_COAST_V_NEW_S    (0.2f)      // speed from samples aged V_NEW..V_OLD (newest are bent)
+#define MM_COAST_V_OLD_S    (1.3f)
+#define MM_COAST_V_MIN_PTS  (8)
+#define MM_COAST_X_NEW_S    (0.5f)      // x from samples aged X_NEW..X_OLD
+#define MM_COAST_X_OLD_S    (1.5f)
+#define MM_COAST_X_BLEND_S  (0.3f)      // edge x -> x from before the edge
+#define MM_COAST_MAX_S      (4.0f)
+#define MM_COAST_FADE_S     (1.2f)      // fade over the last part of MAX_S
+#define MM_COAST_FADE_Z_M   (3.0f)      // fade over the last part of the panel
+#define MM_COAST_FILL_ALPHA (0.22f)
+#define MM_COAST_DASH_M     (0.6f)      // outline dash and gap
+
+enum { MM_COAST_NONE = 0, MM_COAST_RUN, MM_COAST_DONE };
+
 /* association gates (m) */
 #define MM_GATE_Z_MIN       (2.0f)
 #define MM_GATE_Z_RATIO     (0.15f)
@@ -104,6 +131,14 @@ typedef struct {
     float     fut_dx, fut_dz;   // predicted position - position (m), smoothed
     int       lane_ok;          // lane is valid
     int       lane;             // lane relative to the ego lane (0 = ego, +: right)
+    uint64_t  hist_us[MM_COAST_HIST];   // road positions of the last updates, newest at hist_n - 1
+    float     hist_x[MM_COAST_HIST], hist_z[MM_COAST_HIST];
+    uint32_t  hist_n;
+    int       coast;            // MM_COAST_*
+    uint64_t  coast_us;         // displayed frame where it started
+    float     coast_x0, coast_z0;   // position there
+    float     coast_xh, coast_v;    // x and z speed from before the edge
+    float     coast_a;          // opacity
 } stMmTrack;
 
 typedef struct {
@@ -233,14 +268,62 @@ static stMmTrack *mm_new_track(stMmChannel *c, const stMmObs *o)
     return t;
 }
 
+static int mm_at_side(const stBBox *b, float margin)
+{
+    return b->x <= margin || b->x + b->w >= (float)VIEWPORT_WIDTH - margin;
+}
+
+/* Start coasting if t is a vehicle passing through the image side (see MM_COAST_*) */
+static void mm_coast_try(stMmTrack *t, uint64_t now)
+{
+    float sa = 0.0f, sz = 0.0f, saa = 0.0f, saz = 0.0f, xs[MM_COAST_HIST];
+    int nv = 0, nx = 0;
+    uint32_t cnt = t->hist_n < MM_COAST_HIST ? t->hist_n : MM_COAST_HIST;
+
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t k = (t->hist_n - 1 - i) % MM_COAST_HIST;
+        float age = (float)(now - t->hist_us[k]) * 1e-6f;
+        if (age > MM_COAST_V_NEW_S && age <= MM_COAST_V_OLD_S) {
+            sa += age; sz += t->hist_z[k]; saa += age * age; saz += age * t->hist_z[k];
+            nv++;
+        }
+        if (age > MM_COAST_X_NEW_S && age <= MM_COAST_X_OLD_S) {
+            int j = nx++;                                               // insertion sort
+            while (j > 0 && xs[j - 1] > t->hist_x[k]) { xs[j] = xs[j - 1]; j--; }
+            xs[j] = t->hist_x[k];
+        }
+    }
+    if (nv < MM_COAST_V_MIN_PTS) return;
+    float den = (float)nv * saa - sa * sa;
+    if (den <= 0.0f) return;
+    float v = -((float)nv * saz - sa * sz) / den;                       // age runs backwards in time
+    float xh = nx > 0 ? xs[nx / 2] : t->x;
+    if (v >= -MM_COAST_V_MIN || v <= -MM_COAST_V_MAX || fabsf(xh - t->x) > MM_COAST_X_MAX_M) return;
+
+    t->coast = MM_COAST_RUN;
+    t->coast_us = now;
+    t->coast_x0 = t->x;
+    t->coast_z0 = t->z;
+    t->coast_xh = xh;
+    t->coast_v = v;
+    t->coast_a = 1.0f;
+    t->fut_n = 0;
+}
+
 /* EMA per displayed frame, as in the first minimap */
 static void mm_smooth(stMmTrack *t, const stMmObs *o, uint64_t now)
 {
     if (t->n_upd > 0 && t->last_upd_disp_us == now) return;          // already updated this frame
     int restart = (t->n_upd == 0 || now < t->last_upd_disp_us || now - t->last_upd_disp_us > MM_TRACK_GAP_US);
 
+    // back inside the image: the measurement is good again
+    if (t->coast != MM_COAST_NONE && !mm_at_side(&o->in.meas, MM_COAST_CANCEL_PX)) {
+        t->coast = MM_COAST_NONE;
+        restart = 1;
+    }
+
     // predicted offset: same EMA as the position; dropped when this frame has none
-    if (!o->fut_ok) {
+    if (!o->fut_ok || t->coast != MM_COAST_NONE) {
         t->fut_n = 0;
     } else {
         float dx = o->fxm - o->xm, dz = o->fzm - o->zm;
@@ -252,14 +335,24 @@ static void mm_smooth(stMmTrack *t, const stMmObs *o, uint64_t now)
         }
     }
 
-    if (restart) {
-        t->x = o->xm; t->z = o->zm;
-        t->n_upd = 1;
-    } else {
-        t->x += MM_SMOOTH_ALPHA * (o->xm - t->x);
-        t->z += MM_SMOOTH_ALPHA * (o->zm - t->z);
-        t->n_upd++;
+    if (t->coast == MM_COAST_NONE) {
+        if (restart) {
+            t->x = o->xm; t->z = o->zm;
+            t->n_upd = 1;
+        } else {
+            t->x += MM_SMOOTH_ALPHA * (o->xm - t->x);
+            t->z += MM_SMOOTH_ALPHA * (o->zm - t->z);
+            t->n_upd++;
+        }
+#if NC_MINIMAP_COAST
+        if (t->in_range && o->zm < MM_COAST_MAX_Z_M && mm_at_side(&o->in.meas, MM_COAST_EDGE_PX))
+            mm_coast_try(t, now);
+#endif
     }
+    uint32_t h = t->hist_n++ % MM_COAST_HIST;
+    t->hist_us[h] = now;
+    t->hist_x[h] = o->xm;
+    t->hist_z[h] = o->zm;
     t->last_upd_disp_us = now;
     t->v_prev = o->v_raw;
     t->v_prev_us = now;
@@ -392,6 +485,29 @@ static void mm_pitch_and_road(uint32_t ch)
     }
 }
 
+/* move the coasting vehicles of this frame */
+static void mm_coast_step(stMmChannel *c)
+{
+    const uint64_t now = c->t_disp_us;
+
+    for (int i = 0; i < MM_MAX_TRACK; i++) {
+        stMmTrack *t = &c->track[i];
+        if (!t->used || t->coast != MM_COAST_RUN) continue;
+
+        float d = now >= t->coast_us ? (float)(now - t->coast_us) * 1e-6f : MM_COAST_MAX_S + 1.0f;
+        float z = t->coast_z0 + t->coast_v * d;
+        if (d > MM_COAST_MAX_S || z < -MM_BEHIND_M) {
+            t->coast = MM_COAST_DONE;           // stays hidden while the box is still at the edge
+            continue;
+        }
+        float blend = fminf(1.0f, d / MM_COAST_X_BLEND_S);
+        t->x = t->coast_x0 + (t->coast_xh - t->coast_x0) * blend;
+        t->z = z;
+        t->coast_a = fminf(1.0f, fminf((z + MM_BEHIND_M) / MM_COAST_FADE_Z_M,
+                                       (MM_COAST_MAX_S - d) / MM_COAST_FADE_S));
+    }
+}
+
 /* match this frame's detections to minimap tracks and update them */
 static void mm_process(uint32_t ch)
 {
@@ -402,7 +518,8 @@ static void mm_process(uint32_t ch)
         stMmTrack *t = &c->track[i];
         if (!t->used) continue;
         t->highlight = 0;
-        if (now > t->last_seen_disp_us && now - t->last_seen_disp_us > MM_DROP_US) t->used = 0;
+        if (t->coast != MM_COAST_RUN && now > t->last_seen_disp_us && now - t->last_seen_disp_us > MM_DROP_US)
+            t->used = 0;
     }
 
     mm_pitch_and_road(ch);
@@ -464,6 +581,8 @@ static void mm_process(uint32_t ch)
         mm_take_color(t, o);
     }
 
+    mm_coast_step(c);
+
     // range hysteresis
     for (int i = 0; i < MM_MAX_TRACK; i++) {
         stMmTrack *t = &c->track[i];
@@ -476,8 +595,9 @@ static void mm_process(uint32_t ch)
 
 static int mm_track_drawn(const stMmChannel *c, const stMmTrack *t)
 {
-    return t->used && t->in_range &&
-           c->t_disp_us >= t->last_seen_disp_us && c->t_disp_us - t->last_seen_disp_us <= MM_HOLD_US;
+    if (!t->used || !t->in_range || t->coast == MM_COAST_DONE) return 0;
+    if (t->coast == MM_COAST_RUN) return 1;
+    return c->t_disp_us >= t->last_seen_disp_us && c->t_disp_us - t->last_seen_disp_us <= MM_HOLD_US;
 }
 
 /* diagnostics (NC_BEV_LOG). Columns: see nc_bevlog.c */
@@ -509,6 +629,13 @@ static void mm_log(uint32_t ch)
                       t ? mm_track_drawn(c, t) : 0,
                       (double)o->vp_used, (o->geom_t_us == o->in.t_det_us) ? 1 : 0, t ? t->id : 0u,
                       t ? cls_name[t->cls] : "-");
+    }
+    for (int i = 0; i < MM_MAX_TRACK; i++) {
+        const stMmTrack *t = &c->track[i];
+        if (!t->used || t->coast != MM_COAST_RUN) continue;
+        nc_bevlog_row(NC_BEVLOG_COAST, "%llu,%llu,%u,%u,%.3f,%.3f,%.3f,%.3f",
+                      (unsigned long long)c->t_disp_us, (unsigned long long)t->coast_us, ch, t->id,
+                      (double)t->x, (double)t->z, (double)t->coast_v, (double)t->coast_a);
     }
 }
 
@@ -624,6 +751,24 @@ static void mm_road_seg(float x0, float z0, float x1, float z1, int dashed, cons
     float c[4] = {color[0], color[1], color[2], color[3]};
     nc_opengl_draw_line(mm_px(x0 + t0 * dx), mm_py(z0 + t0 * dz), mm_px(x0 + t1 * dx), mm_py(z0 + t1 * dz),
                         dashed ? 2 : 1, c, *p);
+}
+
+/* road rectangle outline made of short solid pieces */
+static void mm_dash_rect(float xc, float w_m, float z0, float z1, const float color[4],
+                         const struct gl_npu_program *p)
+{
+    const float xl = xc - w_m * 0.5f, xr = xc + w_m * 0.5f;
+    const float side[4][4] = { {xl, z0, xr, z0}, {xr, z0, xr, z1}, {xr, z1, xl, z1}, {xl, z1, xl, z0} };
+
+    for (int s = 0; s < 4; s++) {
+        float dx = side[s][2] - side[s][0], dz = side[s][3] - side[s][1];
+        float len = sqrtf(dx * dx + dz * dz);
+        for (float a = 0.0f; a < len; a += 2.0f * MM_COAST_DASH_M) {
+            float b = fminf(a + MM_COAST_DASH_M, len);
+            mm_road_seg(side[s][0] + dx * a / len, side[s][1] + dz * a / len,
+                        side[s][0] + dx * b / len, side[s][1] + dz * b / len, 0, color, p);
+        }
+    }
 }
 
 /* weighted least squares x = a + b z (+ c z^2). Returns 0 on success. */
@@ -1023,6 +1168,13 @@ void nc_minimap_draw(uint32_t ch, struct viewport vp, const stNcMinimapDrawRes *
         fc[3] = 0.95f;
 
         float w = k_cls_w[t->cls], l = k_cls_l[t->cls];
+        if (t->coast == MM_COAST_RUN) {          // not measured: dashed, fading
+            const float dash[4] = {1.0f, 1.0f, 1.0f, t->coast_a};
+            fc[3] = MM_COAST_FILL_ALPHA * t->coast_a;
+            mm_road_rect(t->x, w, t->z, t->z + l, fc, 1, p);
+            mm_dash_rect(t->x, w, t->z, t->z + l, dash, p);
+            continue;
+        }
         mm_road_rect(t->x, w, t->z, t->z + l, fc, 1, p);
         mm_road_rect(t->x, w, t->z, t->z + l, t->highlight ? cutin : edge, 0, p);
     }
@@ -1036,6 +1188,7 @@ void nc_minimap_draw(uint32_t ch, struct viewport vp, const stNcMinimapDrawRes *
     int nearest[2 * MM_PRED_LANE_MAX + 1];
     for (int k = 0; k < 2 * MM_PRED_LANE_MAX + 1; k++) nearest[k] = -1;
     for (int i = 0; i < cnt; i++) {
+        if (c->track[order[i]].coast == MM_COAST_RUN) continue;
         int lane = mm_track_lane(&c->track[order[i]], &ego_fit);
         if (lane >= -MM_PRED_LANE_MAX && lane <= MM_PRED_LANE_MAX) nearest[lane + MM_PRED_LANE_MAX] = order[i];
     }

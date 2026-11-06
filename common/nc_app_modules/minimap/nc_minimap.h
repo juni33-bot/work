@@ -13,6 +13,8 @@
  * Vehicle positions: bottom-centre of the box drawn on the camera view,
  * smoothed per vehicle (EMA). One minimap track per vehicle even if the class
  * (car/truck) or tracker id changes; class shown = vote over recent frames.
+ * A vehicle passing through the side of the image goes on with its last closing
+ * speed down the ego side, dashed and fading: that part is not measured.
  *
  * Per displayed frame:
  *   nc_minimap_begin_frame(ch, t_disp);      // before adding detections
@@ -51,6 +53,10 @@
 #define NC_MINIMAP_PITCH_MAX_PX      (15.0f)
 #define NC_MINIMAP_PITCH_OUTLIER_PX  (25.0f)
 #define NC_MINIMAP_PITCH_MIN_VEH     (2)
+
+/* 1: passing vehicles go on beside the ego vehicle after leaving the image (see MM_COAST_*)
+ * 0: they stop at the image side and disappear after the hold */
+#define NC_MINIMAP_COAST (1)
 
 /* 1: lane line style from the UFLD lane_class output (1 = solid, 2 = dashed per
  *    the ini comment; mapping not verified on the board yet)

@@ -6,7 +6,8 @@
 #include "nc_bevlog.h"
 
 static const char *const k_name[NC_BEVLOG_NUM] = {
-    "bev_obj.csv", "bev_det.csv", "bev_lane.csv", "bev_frame.csv", "bev_lanepts.csv", "bev_lanefit.csv"
+    "bev_obj.csv", "bev_det.csv", "bev_lane.csv", "bev_frame.csv", "bev_lanepts.csv", "bev_lanefit.csv",
+    "bev_coast.csv"
 };
 
 /* column headers (keep in sync with the callers) */
@@ -27,7 +28,9 @@ static const char *const k_header[NC_BEVLOG_NUM] = {
     /* lanepts: lane points used by the minimap (render thread), pts = u:v;u:v;... */
     "t_lane_us,ch,lane,lane_class,point_cnt,k_cal,vp_cal,pts",
     /* lanefit: minimap lane model (render thread). x(z) = c0 + h z + c_shown z^2 */
-    "t_lane_us,ch,both,n_pts,k,vp,c_raw,c_filt,c_shown,curve_on,c0,h"
+    "t_lane_us,ch,both,n_pts,k,vp,c_raw,c_filt,c_shown,curve_on,c0,h",
+    /* coast: vehicle drawn beyond the image side (render thread), not measured */
+    "t_disp_us,t_start_us,ch,mm_id,x_m,z_m,v_mps,alpha"
 };
 
 static FILE *g_fp[NC_BEVLOG_NUM];

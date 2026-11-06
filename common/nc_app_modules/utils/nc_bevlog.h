@@ -14,6 +14,7 @@
  *     bev_lanepts.csv render thread, one row per lane line per new lane result:
  *                   the points the minimap gets (after the UFLD average), pts = u:v;u:v;...
  *     bev_lanefit.csv render thread, one row per new lane result: minimap lane model
+ *     bev_coast.csv render thread, one row per coasting vehicle per displayed frame
  * When disabled every call returns immediately.
  */
 
@@ -30,6 +31,7 @@ typedef enum {
     NC_BEVLOG_FRAME,
     NC_BEVLOG_LANEPTS,
     NC_BEVLOG_LANEFIT,
+    NC_BEVLOG_COAST,
     NC_BEVLOG_NUM
 } eNcBevLogFile;
 
