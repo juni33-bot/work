@@ -18,7 +18,9 @@
  * class, so track_id is unique only within a class.
  *
  * Kalman state [cx, cy, vx, vy] (px, px/s), variable dt from frame
- * timestamps. Box size = last measured w/h. All times are monotonic us
+ * timestamps. A second filter on the same measurements, with a smaller
+ * process noise, gives the velocity used after the displayed frame.
+ * Box size = last measured w/h. All times are monotonic us
  * (same clock as cnn_output->time_stamp_us).
  */
 
@@ -36,7 +38,7 @@ extern "C" {
 #define NC_TRAJ_MIN_HIST                (3)     /* measurements needed before predicting */
 #define NC_TRAJ_MAX_PREDICT_MS_DEFAULT  (120)   /* extrapolation cap (100~150 ms) */
 #define NC_TRAJ_STALE_US                (500000ULL) /* drop track not measured for this long */
-#define NC_TRAJ_FUTURE_MS_DEFAULT       (500)   /* future trajectory horizon (draw / cut-in) */
+#define NC_TRAJ_FUTURE_MS_DEFAULT       (500)   /* future trajectory horizon (draw) */
 #define NC_TRAJ_FUTURE_MS_MAX           (1000)  /* CV model is unreliable beyond this */
 
 typedef struct {
@@ -69,8 +71,8 @@ int nc_traj_get_predicted_box(int ch, int class_id, int track_id,
 
 /* [render thread] after nc_traj_predict_frame(). Box center horizon_ms AFTER
  * target_time_us (future trajectory, for the prediction line and cut-in).
- * Uses the same snapshot / velocity as nc_traj_get_predicted_box(), but its own
- * cap: dt = min(now - last_meas, max_predict) + min(horizon, FUTURE_MS_MAX).
+ * Up to target_time_us: same snapshot, velocity and cap as nc_traj_get_predicted_box().
+ * After it: min(horizon, FUTURE_MS_MAX) at the velocity of the second filter.
  * Returns 1 and fills *cx,*cy (screen px); 0 under the same conditions as
  * nc_traj_get_predicted_box(). */
 int nc_traj_get_future_center(int ch, int class_id, int track_id,

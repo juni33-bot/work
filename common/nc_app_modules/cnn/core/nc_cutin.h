@@ -29,6 +29,8 @@ extern "C" {
 
 #define NC_CUTIN_MAX_CH          (8)
 #define NC_CUTIN_MAX_TRACKS      (64)     /* per channel */
+#define NC_CUTIN_FUTURE_MS       (800)    /* horizon of the future point (longer than the drawn line:
+                                           * the smooth future velocity reacts later) */
 #define NC_CUTIN_LANE_MARGIN     (0.10f)  /* future point must be this far inside (lane width ratio) */
 #define NC_CUTIN_ON_FRAMES       (3)
 #define NC_CUTIN_OFF_FRAMES      (10)

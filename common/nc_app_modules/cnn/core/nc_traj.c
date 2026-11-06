@@ -9,6 +9,8 @@
 #define NC_TRAJ_MEAS_STD_PX     (4.0f)    /* measurement noise std */
 #define NC_TRAJ_ACCEL_STD_PX    (800.0f)  /* process noise: accel std (px/s^2) */
 #define NC_TRAJ_INIT_VEL_STD    (500.0f)  /* initial velocity std (px/s) */
+#define NC_TRAJ_FUT_ACCEL_STD_PX (100.0f) /* same, for the velocity of the future point:
+                                           * smoother, reacts later (tools/pred_error.py) */
 
 /* ---------------- shared state (worker writes, guarded by g_lock) ---------------- */
 
@@ -27,7 +29,8 @@ typedef struct {
     int         is_vehicle;
     float       w, h;
     uint64_t    last_meas_us;
-    stKfAxis    kx, ky;
+    stKfAxis    kx, ky;      /* box: position, velocity up to the displayed frame */
+    stKfAxis    fx, fy;      /* same measurements: velocity after the displayed frame */
     stTrajPoint hist[NC_TRAJ_HIST_LEN];
     int         hist_head;   /* next write index */
     int         hist_cnt;
@@ -44,6 +47,7 @@ typedef struct {
     int      class_id, track_id;
     int      predictable;
     float    cx, cy, vx, vy, w, h;
+    float    fvx, fvy;
     uint64_t last_meas_us;
 } stTrajSnap;
 
@@ -68,9 +72,9 @@ static void kf_init(stKfAxis *k, float z)
 }
 
 /* predict by dt (s) with white-noise acceleration model */
-static void kf_predict(stKfAxis *k, float dt)
+static void kf_predict(stKfAxis *k, float dt, float accel_std)
 {
-    const float q   = NC_TRAJ_ACCEL_STD_PX * NC_TRAJ_ACCEL_STD_PX;
+    const float q   = accel_std * accel_std;
     const float dt2 = dt * dt;
 
     k->p += k->v * dt;
@@ -139,6 +143,8 @@ static void track_start(stTrajTrack *t, int class_id, int track_id, int is_vehic
     t->is_vehicle = is_vehicle;
     kf_init(&t->kx, cx);
     kf_init(&t->ky, cy);
+    kf_init(&t->fx, cx);
+    kf_init(&t->fy, cy);
     t->w = w; t->h = h;
     t->last_meas_us = ts;
     hist_push(t, cx, cy, ts);
@@ -206,10 +212,14 @@ void nc_traj_update(int ch, E_NETWORK_UID net_id,
             }
 
             float dt = (float)dt_us * 1e-6f;
-            kf_predict(&t->kx, dt);
-            kf_predict(&t->ky, dt);
+            kf_predict(&t->kx, dt, NC_TRAJ_ACCEL_STD_PX);
+            kf_predict(&t->ky, dt, NC_TRAJ_ACCEL_STD_PX);
             kf_update(&t->kx, cx);
             kf_update(&t->ky, cy);
+            kf_predict(&t->fx, dt, NC_TRAJ_FUT_ACCEL_STD_PX);
+            kf_predict(&t->fy, dt, NC_TRAJ_FUT_ACCEL_STD_PX);
+            kf_update(&t->fx, cx);
+            kf_update(&t->fy, cy);
             t->w = o->bbox.w;
             t->h = o->bbox.h;
             t->last_meas_us = frame_ts_us;
@@ -246,6 +256,7 @@ void nc_traj_predict_frame(int ch, uint64_t target_time_us)
         s->predictable = t->is_vehicle && (t->hist_cnt >= NC_TRAJ_MIN_HIST);
         s->cx = t->kx.p; s->vx = t->kx.v;
         s->cy = t->ky.p; s->vy = t->ky.v;
+        s->fvx = t->fx.v; s->fvy = t->fy.v;
         s->w = t->w; s->h = t->h;
         s->last_meas_us = t->last_meas_us;
     }
@@ -312,10 +323,11 @@ int nc_traj_get_future_center(int ch, int class_id, int track_id,
 
     if (horizon_ms < 0.0f) horizon_ms = 0.0f;
     if (horizon_ms > (float)NC_TRAJ_FUTURE_MS_MAX) horizon_ms = (float)NC_TRAJ_FUTURE_MS_MAX;
-    float dt = snap_now_dt(s, target_time_us) + horizon_ms * 1e-3f;
+    float dt = snap_now_dt(s, target_time_us);
+    float hz = horizon_ms * 1e-3f;
 
-    *cx = s->cx + s->vx * dt;
-    *cy = s->cy + s->vy * dt;
+    *cx = s->cx + s->vx * dt + s->fvx * hz;
+    *cy = s->cy + s->vy * dt + s->fvy * hz;
     return 1;
 }
 

@@ -572,6 +572,7 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                 int   has_future = 0;
                 int   pred_valid = 0;
                 float fut_cx = 0.f, fut_cy = 0.f;
+                float cut_cx = 0.f, cut_cy = 0.f;
                 if (net_result->cam_channel < VIDEO_MAX_CH) {
                     int      tch    = (int)net_result->cam_channel;
                     uint64_t disp_t = g_disp_frame_ts_us[tch];
@@ -583,13 +584,17 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                         has_future = nc_traj_get_future_center(tch, i, obj_info.track_id, disp_t,
                                                                (float)NC_TRAJ_FUTURE_MS_DEFAULT,
                                                                &fut_cx, &fut_cy);
+                        if (has_future) {
+                            nc_traj_get_future_center(tch, i, obj_info.track_id, disp_t,
+                                                      (float)NC_CUTIN_FUTURE_MS, &cut_cx, &cut_cy);
+                        }
                     }
                 }
                 // cut-in: future bottom-center enters the ego lane (lane coordinates)
                 int is_cutin = 0;
                 if (has_future) {
                     is_cutin = nc_cutin_eval(cut_ch, i, obj_info.track_id, &obj_info.bbox,
-                                             fut_cx, fut_cy, g_disp_frame_ts_us[cut_ch]);
+                                             cut_cx, cut_cy, g_disp_frame_ts_us[cut_ch]);
                 }
                 float *dcolor = is_cutin ? g_cutin_color : color[i];
 
