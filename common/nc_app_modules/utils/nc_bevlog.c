@@ -6,7 +6,7 @@
 #include "nc_bevlog.h"
 
 static const char *const k_name[NC_BEVLOG_NUM] = {
-    "bev_obj.csv", "bev_det.csv", "bev_lane.csv", "bev_frame.csv"
+    "bev_obj.csv", "bev_det.csv", "bev_lane.csv", "bev_frame.csv", "bev_lanepts.csv", "bev_lanefit.csv"
 };
 
 /* column headers (keep in sync with the callers) */
@@ -23,7 +23,11 @@ static const char *const k_header[NC_BEVLOG_NUM] = {
     "state,dist_l_m,dist_r_m,lat_vel_mps,tlc_s,tlc_thresh_s,cnt_l,cnt_r,warn_until_us,latency_ms,"
     "class0,class1,class2,class3",
     /* frame: render timing */
-    "t_us,gl_ms,frame_ms"
+    "t_us,gl_ms,frame_ms",
+    /* lanepts: lane points used by the minimap (render thread), pts = u:v;u:v;... */
+    "t_lane_us,ch,lane,lane_class,point_cnt,k_cal,vp_cal,pts",
+    /* lanefit: minimap lane model (render thread). x(z) = c0 + h z + c_shown z^2 */
+    "t_lane_us,ch,both,n_pts,k,vp,c_raw,c_filt,c_shown,curve_on,c0,h"
 };
 
 static FILE *g_fp[NC_BEVLOG_NUM];

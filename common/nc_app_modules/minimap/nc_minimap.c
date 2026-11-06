@@ -17,6 +17,7 @@
  * EMA 0.35 per displayed frame. On top of it only display logic was added
  * (track joining over class / id changes, class vote, range hysteresis,
  * short hold, opaque panel, lanes from the network points).
+ * Vehicle lateral position and the lanes use the geometry of the lane frame itself.
  * Drawing uses only the existing rectangle / line / quad primitives.
  */
 
@@ -25,6 +26,7 @@
 #define MM_MAX_ALIAS        (4)         // (class, tracker id) keys per minimap track
 #define MM_BEHIND_M         (3.0f)      // road shown behind the camera (ego body)
 
+#define MM_LANE_LINES       (4)         // network lane slots: 0, 3 outer lines, 1, 2 ego lines
 #define MM_PRED_LANE_MAX    (4)         // lanes each side of the ego lane for the nearest-vehicle search
 #define MM_SMOOTH_ALPHA     (0.35f)     // position EMA per displayed frame (as before)
 #define MM_TRACK_GAP_US     (500000ULL) // longer gap -> restart smoothing / no re-association
@@ -43,14 +45,25 @@
 #define MM_CLS_DECAY        (0.8f)
 #define MM_CLS_SWITCH       (1.0f)      // other class must lead by this much to switch
 
-/* lanes: the network points of each line are fitted in road coordinates with
- * x = a + b*z (+ c*z^2) and the fit is drawn over the whole panel height
- * (behind the camera to NC_MINIMAP_RANGE_M). The part outside the real points
- * is an extrapolation and is drawn fainter. */
-#define MM_LANE_MAX_Z_M      (60.0f)    // ignore points farther than this (noisy)
-#define MM_LANE_MIN_SPAN_M   (3.0f)     // need points over at least this z span
-#define MM_LANE_QUAD_SPAN_M  (8.0f)     // quadratic term only with this much span and >= 4 points
-#define MM_LANE_MAX_CURV     (0.003f)   // |c| limit (1/(2R), R ~ 170 m): no wild bends
+/* lanes: one centre curve x = c0 + h*z + c*z^2 from the ego-line points, with this
+ * frame's geometry (k_inst, vp_inst); lines are drawn at fixed offsets from it, so the
+ * lane width never changes. The ego-line points end near 13 m, and in the board logs
+ * c from them is wrong by up to about 3 m of bend at 25 m on straight roads, so c is
+ * only used above CURVE_ON_M: gentle curves are drawn straight on purpose. */
+#define MM_LANE_MAX_Z_M      (40.0f)    // ignore points farther than this (noisy)
+#define MM_LANE_MIN_ROW_PX   (8.0f)     // ignore points this close to the horizon
+#define MM_LANE_MIN_PTS      (4)        // fewer points in a frame: keep the last model
+#define MM_LANE_QUAD_SPAN_M  (5.0f)     // need this z span to measure c
+#define MM_LANE_CURVE_REF_M  (25.0f)    // CURVE_ON/OFF are the bend at this distance
+#define MM_LANE_CURVE_ON_M   (4.5f)     // straight -> curve
+#define MM_LANE_CURVE_OFF_M  (3.2f)     // curve -> straight
+#define MM_LANE_C_TAU_S      (1.0f)     // low-pass of the measured c
+#define MM_LANE_SHOW_TAU_S   (0.4f)     // fade between straight and curve
+#define MM_LANE_POS_TAU_S    (0.09f)    // low-pass of c0, h (same as EMA 0.35 at 26 fps)
+#define MM_LANE_INST_MAX_PX  (30.0f)    // frame horizon this far from the calibrated one: bad frame
+#define MM_LANE_GEOM_HOLD_US (1000000ULL) // keep the last frame geometry this long (one line lost)
+#define MM_LANE_HOLD_US      (500000ULL)  // no fit this long: lanes are not drawn
+#define MM_LANE_OUTER_HOLD_US (1000000ULL)// outer line not detected this long: not drawn
 #define MM_LANE_SEG_M        (4.0f)     // drawn segment length
 #define MM_LANE_EXTRAP_ALPHA (0.55f)    // alpha factor of the extrapolated part
 
@@ -108,6 +121,20 @@ typedef struct {
 } stMmObs;
 
 typedef struct {
+    uint64_t  t_us;             // lane frame of the last update
+    uint64_t  fit_us;           // lane frame of the last fit (0 = none)
+    float     k_hold, vp_hold;  // last good frame geometry
+    uint64_t  hold_us;          // its lane frame (0 = none)
+    float     c0, h;            // offset, heading of the centre curve
+    int       c_init;
+    float     c_filt, c_shown;  // measured / drawn curvature
+    int       curve_on;
+    float     zmin, zmax;       // range of the real points
+    int       cls[MM_LANE_LINES];
+    uint64_t  seen_us[MM_LANE_LINES];
+} stMmLaneModel;
+
+typedef struct {
     uint64_t  t_disp_us;
     int       obs_cnt;
     stMmObs   obs[MM_MAX_OBS];
@@ -116,6 +143,8 @@ typedef struct {
     uint64_t  prev_disp_us;     // previous displayed frame
     float     pitch_px;         // pitch offset of the box bottoms (px, + = down)
     uint64_t  pitch_us;         // displayed frame of pitch_px
+    uint64_t  lane_log_us;      // lane frame already written to bev_lanepts.csv
+    stMmLaneModel lane;
 } stMmChannel;
 
 static stMmChannel  g_mm[NC_LDW_MAX_CH];    // render thread only
@@ -270,6 +299,40 @@ void nc_minimap_add_obj(uint32_t ch, const stNcMinimapObj *in)
     }
 }
 
+/* 1 if g has a good frame geometry of its own */
+static int mm_frame_ok(const stNcLdwGeom *g)
+{
+    return g->k_inst > 0.0f && fabsf(g->vp_inst - g->vp_y) <= MM_LANE_INST_MAX_PX;
+}
+
+/* Geometry for the lanes and the vehicle lateral position: the frame geometry, or the
+ * last good one while a line is lost (one line can drop out every other frame, and
+ * switching to the calibrated geometry in those frames shakes everything).
+ * Returns 0 if there is none: gi is then the calibrated geometry. */
+static int mm_frame_geom(uint32_t ch, const stNcLdwGeom *g, stNcLdwGeom *gi)
+{
+    stMmLaneModel *M = &g_mm[ch].lane;
+    *gi = *g;
+    if (mm_frame_ok(g)) {
+        M->k_hold = g->k_inst;
+        M->vp_hold = g->vp_inst;
+        M->hold_us = g->t_us;
+    }
+    if (M->hold_us == 0 || g->t_us < M->hold_us || g->t_us - M->hold_us > MM_LANE_GEOM_HOLD_US) return 0;
+    gi->k = M->k_hold;
+    gi->vp_y = M->vp_hold;
+    return 1;
+}
+
+/* Lateral position with the geometry of the lanes: the vehicle keeps its place between
+ * the lines. Distance stays on the calibrated geometry. */
+static void mm_lateral(uint32_t ch, const stNcLdwGeom *g, float u, float v, float *x_m)
+{
+    stNcLdwGeom gi;
+    float x;
+    if (mm_frame_geom(ch, g, &gi) && nc_ldw_geom_to_road(ch, &gi, u, v, &x, NULL) == 0) *x_m = x;
+}
+
 /* pitch offset from the common bottom move of the known vehicles, then the road
  * position of every detection with bottom - offset */
 static void mm_pitch_and_road(uint32_t ch)
@@ -315,12 +378,15 @@ static void mm_pitch_and_road(uint32_t ch)
             o->ok = 0;
             continue;
         }
+        mm_lateral(ch, &o->geom, o->u, o->v_used, &o->xm);
 #if NC_MINIMAP_SHOW_PRED
         // predicted point: same geometry and pitch offset as the current point
         if (o->in.fut_valid) {
             float fv = o->in.fut_v - (o->v_raw - o->v_used);
-            if (nc_ldw_geom_to_road(ch, &o->geom, o->in.fut_u, fv, &o->fxm, &o->fzm) == 0 && o->fzm > 0.0f)
+            if (nc_ldw_geom_to_road(ch, &o->geom, o->in.fut_u, fv, &o->fxm, &o->fzm) == 0 && o->fzm > 0.0f) {
+                mm_lateral(ch, &o->geom, o->in.fut_u, fv, &o->fxm);
                 o->fut_ok = 1;
+            }
         }
 #endif
     }
@@ -560,13 +626,12 @@ static void mm_road_seg(float x0, float z0, float x1, float z1, int dashed, cons
                         dashed ? 2 : 1, c, *p);
 }
 
-/* weighted least squares x = a + b z (+ c z^2). Near points weigh more (their
- * road position is more accurate). Returns 0 on success. */
-static int mm_lane_fit(const float *xs, const float *zs, int m, int quad, float coef[3])
+/* weighted least squares x = a + b z (+ c z^2). Returns 0 on success. */
+static int mm_lane_fit(const float *xs, const float *zs, const float *ws, int m, int quad, float coef[3])
 {
     double S[5] = {0}, T[3] = {0};               // sum w z^k (k 0..4), sum w x z^k (k 0..2)
     for (int j = 0; j < m; j++) {
-        double w = 1.0 / (1.0 + zs[j] * 0.1), zk = 1.0;
+        double w = ws[j], zk = 1.0;
         for (int k = 0; k < 5; k++) { S[k] += w * zk; if (k < 3) T[k] += w * xs[j] * zk; zk *= zs[j]; }
     }
     coef[0] = coef[1] = coef[2] = 0.0f;
@@ -575,25 +640,19 @@ static int mm_lane_fit(const float *xs, const float *zs, int m, int quad, float 
         double det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1])
                    - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0])
                    + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
-        if (fabs(det) > 1e-9) {
-            double r[3];
-            for (int col = 0; col < 3; col++) {
-                double B[3][3];
-                memcpy(B, A, sizeof(B));
-                for (int row = 0; row < 3; row++) B[row][col] = T[row];
-                r[col] = (B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1])
-                        - B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0])
-                        + B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0])) / det;
-            }
-            if (fabs(r[2]) <= MM_LANE_MAX_CURV) {
-                coef[0] = (float)r[0]; coef[1] = (float)r[1]; coef[2] = (float)r[2];
-                return 0;
-            }
+        if (fabs(det) < 1e-12) return -1;
+        for (int col = 0; col < 3; col++) {
+            double B[3][3];
+            memcpy(B, A, sizeof(B));
+            for (int row = 0; row < 3; row++) B[row][col] = T[row];
+            coef[col] = (float)((B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1])
+                               - B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0])
+                               + B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0])) / det);
         }
-        // singular or too curved: fall back to a straight line
+        return 0;
     }
     double det = S[0] * S[2] - S[1] * S[1];
-    if (fabs(det) < 1e-9) return -1;
+    if (fabs(det) < 1e-12) return -1;
     coef[1] = (float)((S[0] * T[1] - S[1] * T[0]) / det);
     coef[0] = (float)((T[0] - coef[1] * S[1]) / S[0]);
     return 0;
@@ -605,8 +664,138 @@ typedef struct {
     float cf[2][3];
 } stMmEgoFit;
 
-/* Lane lines from the network points of the newest lane frame, with the same
- * geometry as the vehicles, fitted and drawn over the whole panel height.
+/* diagnostics (NC_BEV_LOG): lane points of a new lane frame, one row per lane line.
+ * Empty lines are written too, so that lost lines show up in the log. */
+static void mm_log_lanes(uint32_t ch, const stNcLdwLanes *L, const stNcLdwGeom *g)
+{
+    if (!nc_bevlog_enabled() || L->t_us == g_mm[ch].lane_log_us) return;
+    g_mm[ch].lane_log_us = L->t_us;
+
+    for (int i = 0; i < L->lane_num; i++) {
+        const stLaneDet *ln = &L->lane[i];
+        int n = ln->point_cnt;
+        if (n < 0) n = 0;
+        if (n > MAX_POINT_CNT_OF_LANE) n = MAX_POINT_CNT_OF_LANE;
+
+        char pts[MAX_POINT_CNT_OF_LANE * 16 + 1];
+        size_t len = 0;
+        pts[0] = '\0';
+        for (int j = 0; j < n; j++) {
+            int w = snprintf(pts + len, sizeof(pts) - len, "%s%.1f:%.1f", j ? ";" : "",
+                             (double)ln->point[j].x, (double)ln->point[j].y);
+            if (w < 0 || (size_t)w >= sizeof(pts) - len) { pts[len] = '\0'; break; }   // keep whole points only
+            len += (size_t)w;
+        }
+        nc_bevlog_row(NC_BEVLOG_LANEPTS, "%llu,%u,%d,%d,%d,%.5f,%.2f,%s",
+                      (unsigned long long)L->t_us, ch, i, ln->lane_class, n,
+                      (double)g->k, (double)g->vp_y, pts);
+    }
+}
+
+/* road points of lane slot s with geometry gi. Returns the count, *mean_x = their mean. */
+static int mm_lane_points(uint32_t ch, const stNcLdwGeom *gi, const stLaneDet *ln,
+                          float *xs, float *zs, float *mean_x)
+{
+    int n = ln->point_cnt, m = 0;
+    float sum = 0.0f;
+    if (n > MAX_POINT_CNT_OF_LANE) n = MAX_POINT_CNT_OF_LANE;
+    for (int j = 0; j < n; j++) {
+        float u = ln->point[j].x, v = ln->point[j].y, x, z;
+        if (!isfinite(u) || !isfinite(v) || (u <= 0.0f && v <= 0.0f)) continue;
+        if (v - gi->vp_y < MM_LANE_MIN_ROW_PX) continue;
+        if (nc_ldw_geom_to_road(ch, gi, u, v, &x, &z) != 0 || z <= 0.0f || z > MM_LANE_MAX_Z_M) continue;
+        xs[m] = x; zs[m] = z; m++;
+        sum += x;
+    }
+    *mean_x = m > 0 ? sum / (float)m : 0.0f;
+    return m;
+}
+
+/* Update the lane model of channel ch from a new lane frame. Both ego lines give one
+ * centre curve, a single line gives it through the fixed lane width. */
+static void mm_lane_update(uint32_t ch, const stNcLdwLanes *L, const stNcLdwGeom *g)
+{
+    stMmLaneModel *M = &g_mm[ch].lane;
+    if (L->t_us == M->t_us) return;
+    float dt = M->t_us != 0 && L->t_us > M->t_us ? (float)(L->t_us - M->t_us) * 1e-6f : 0.04f;
+    M->t_us = L->t_us;
+
+    for (int i = 0; i < MM_LANE_LINES && i < L->lane_num; i++) {
+        if (L->lane[i].point_cnt > 0) {
+            M->seen_us[i] = L->t_us;
+            M->cls[i] = L->lane[i].lane_class;
+        }
+    }
+
+    const int li = (int)NC_LDW_EGO_LANE.left_boundary_index, ri = (int)NC_LDW_EGO_LANE.right_boundary_index;
+    if (L->lane_num <= li || L->lane_num <= ri) return;
+
+    const int both = mm_frame_ok(g);
+    stNcLdwGeom gi;
+    mm_frame_geom(ch, g, &gi);
+
+    // points of the two lines; left and right by position, as in LDW
+    float px[2][MAX_POINT_CNT_OF_LANE], pz[2][MAX_POINT_CNT_OF_LANE], mean[2];
+    int cnt[2];
+    cnt[0] = mm_lane_points(ch, &gi, &L->lane[li], px[0], pz[0], &mean[0]);
+    cnt[1] = mm_lane_points(ch, &gi, &L->lane[ri], px[1], pz[1], &mean[1]);
+
+    float xs[2 * MAX_POINT_CNT_OF_LANE], zs[2 * MAX_POINT_CNT_OF_LANE], ws[2 * MAX_POINT_CNT_OF_LANE];
+    float zmin = 1e9f, zmax = -1e9f;
+    int m = 0;
+    const float half = NC_LDW_DEFAULT_LANE_WIDTH_M * 0.5f;
+    for (int s = 0; s < 2; s++) {
+        if (cnt[s] == 0) continue;
+        int is_left = (both && cnt[0] > 0 && cnt[1] > 0) ? mean[s] < mean[1 - s] : mean[s] < 0.0f;
+        if (!(is_left ? g->left_ok : g->right_ok)) continue;
+        for (int j = 0; j < cnt[s]; j++) {
+            float z = pz[s][j];
+            xs[m] = px[s][j] + (is_left ? half : -half);
+            zs[m] = z;
+            ws[m] = 1.0f / (z * z);               // equal noise in pixels
+            m++;
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+        }
+    }
+    if (m < MM_LANE_MIN_PTS) return;
+
+    float cf[3], c_raw = 0.0f;
+    if (both && zmax - zmin > MM_LANE_QUAD_SPAN_M && mm_lane_fit(xs, zs, ws, m, 1, cf) == 0) {
+        c_raw = cf[2];
+        if (!M->c_init) { M->c_filt = c_raw; M->c_init = 1; }
+        M->c_filt += (1.0f - expf(-dt / MM_LANE_C_TAU_S)) * (c_raw - M->c_filt);
+    }
+    const float ref2 = MM_LANE_CURVE_REF_M * MM_LANE_CURVE_REF_M;
+    float bend = fabsf(M->c_filt) * ref2;
+    if (!M->curve_on && bend > MM_LANE_CURVE_ON_M) M->curve_on = 1;
+    else if (M->curve_on && bend < MM_LANE_CURVE_OFF_M) M->curve_on = 0;
+    M->c_shown += (1.0f - expf(-dt / MM_LANE_SHOW_TAU_S)) * ((M->curve_on ? M->c_filt : 0.0f) - M->c_shown);
+
+    // offset and heading with the drawn curvature
+    for (int j = 0; j < m; j++) xs[j] -= M->c_shown * zs[j] * zs[j];
+    if (mm_lane_fit(xs, zs, ws, m, 0, cf) != 0) return;
+    if (M->fit_us == 0) {
+        M->c0 = cf[0]; M->h = cf[1];
+    } else {
+        float a = 1.0f - expf(-dt / MM_LANE_POS_TAU_S);
+        M->c0 += a * (cf[0] - M->c0);
+        M->h  += a * (cf[1] - M->h);
+    }
+    M->fit_us = L->t_us;
+    M->zmin = zmin;
+    M->zmax = zmax;
+
+    if (nc_bevlog_enabled())
+        nc_bevlog_row(NC_BEVLOG_LANEFIT, "%llu,%u,%d,%d,%.5f,%.2f,%.6f,%.6f,%.6f,%d,%.4f,%.5f",
+                      (unsigned long long)L->t_us, ch, both, m, (double)gi.k, (double)gi.vp_y,
+                      (double)c_raw, (double)M->c_filt, (double)M->c_shown, M->curve_on,
+                      (double)M->c0, (double)M->h);
+}
+
+/* Lane lines of the lane model at fixed offsets from the centre curve, over the whole
+ * panel height. Ego lines are drawn while the model is valid, outer lines only while
+ * their network line is detected. The part outside the real points is fainter.
  * Style: lane class 1 = solid, 2 = dashed, other = dashed (never guessed solid);
  * NC_MINIMAP_USE_LANE_CLASS 0 = all dashed. Ego-lane boundaries white, others grey. */
 static void mm_draw_lanes(uint32_t ch, stMmEgoFit *ego_fit, const struct gl_npu_program *p)
@@ -615,43 +804,33 @@ static void mm_draw_lanes(uint32_t ch, stMmEgoFit *ego_fit, const struct gl_npu_
     stNcLdwGeom g;
     if (nc_ldw_app_get_lanes(ch, L) != 0) return;
     if (nc_ldw_app_get_geom(ch, 0, &g) < 0) return;
+    mm_log_lanes(ch, L, &g);
+    mm_lane_update(ch, L, &g);
+
+    const stMmLaneModel *M = &g_mm[ch].lane;
+    if (M->fit_us == 0 || L->t_us - M->fit_us > MM_LANE_HOLD_US) return;
 
     const float ego_col[4] = {1.0f, 1.0f, 1.0f, 0.95f};
     const float adj_col[4] = {0.70f, 0.70f, 0.70f, 0.90f};
+    const float w = NC_LDW_DEFAULT_LANE_WIDTH_M;
+    const int li = (int)NC_LDW_EGO_LANE.left_boundary_index, ri = (int)NC_LDW_EGO_LANE.right_boundary_index;
+    const struct { int slot; float offset; } lines[MM_LANE_LINES] = {
+        { li - 1, -1.5f * w }, { li, -0.5f * w }, { ri, 0.5f * w }, { ri + 1, 1.5f * w },
+    };
 
-    for (int i = 0; i < L->lane_num; i++) {
-        const stLaneDet *ln = &L->lane[i];
-        int n = ln->point_cnt;
-        if (n > MAX_POINT_CNT_OF_LANE) n = MAX_POINT_CNT_OF_LANE;
-        if (n < 2) continue;
+    for (int s = 0; s < 2; s++) {
+        ego_fit->ok[s] = 1;
+        ego_fit->cf[s][0] = M->c0 + (s ? 0.5f : -0.5f) * w;
+        ego_fit->cf[s][1] = M->h;
+        ego_fit->cf[s][2] = M->c_shown;
+    }
 
-        float xs[MAX_POINT_CNT_OF_LANE], zs[MAX_POINT_CNT_OF_LANE];
-        float zmin = 1e9f, zmax = -1e9f;
-        int m = 0;
-        for (int j = 0; j < n; j++) {
-            float u = ln->point[j].x, v = ln->point[j].y;
-            if (!isfinite(u) || !isfinite(v) || (u <= 0.0f && v <= 0.0f)) continue;
-            float x, z;
-            if (nc_ldw_geom_to_road(ch, &g, u, v, &x, &z) != 0 || z <= 0.0f || z > MM_LANE_MAX_Z_M) continue;
-            xs[m] = x; zs[m] = z; m++;
-            if (z < zmin) zmin = z;
-            if (z > zmax) zmax = z;
-        }
-        if (m < 2 || zmax - zmin < MM_LANE_MIN_SPAN_M) continue;
+    for (int i = 0; i < MM_LANE_LINES; i++) {
+        int slot = lines[i].slot;
+        int ego = (slot == li || slot == ri);
+        if (!ego && (M->seen_us[slot] == 0 || L->t_us - M->seen_us[slot] > MM_LANE_OUTER_HOLD_US)) continue;
 
-        float cf[3];
-        int quad = (m >= 4 && zmax - zmin >= MM_LANE_QUAD_SPAN_M);
-        if (mm_lane_fit(xs, zs, m, quad, cf) != 0) continue;
-
-        int ego = (i == (int)NC_LDW_EGO_LANE.left_boundary_index ||
-                   i == (int)NC_LDW_EGO_LANE.right_boundary_index);
-        for (int s = 0; s < 2; s++) {
-            if (i == (int)(s ? NC_LDW_EGO_LANE.right_boundary_index : NC_LDW_EGO_LANE.left_boundary_index)) {
-                ego_fit->ok[s] = 1;
-                memcpy(ego_fit->cf[s], cf, sizeof(cf));
-            }
-        }
-        int dashed = NC_MINIMAP_USE_LANE_CLASS ? (ln->lane_class != 1) : 1;
+        int dashed = NC_MINIMAP_USE_LANE_CLASS ? (M->cls[slot] != 1) : 1;
         const float *col = ego ? ego_col : adj_col;
         const float fcol[4] = {col[0], col[1], col[2], col[3] * MM_LANE_EXTRAP_ALPHA};
 
@@ -659,7 +838,7 @@ static void mm_draw_lanes(uint32_t ch, stMmEgoFit *ego_fit, const struct gl_npu_
         float zb[16];
         int nb = 0;
         const float z_lo = -MM_BEHIND_M, z_hi = NC_MINIMAP_RANGE_M;
-        const float cuts[2] = { zmin, zmax };
+        const float cuts[2] = { M->zmin, M->zmax };
         zb[nb++] = z_lo;
         for (float z = z_lo + MM_LANE_SEG_M; ; z += MM_LANE_SEG_M) {
             for (int k = 0; k < 2; k++)                   // insert the cuts in order
@@ -667,13 +846,14 @@ static void mm_draw_lanes(uint32_t ch, stMmEgoFit *ego_fit, const struct gl_npu_
             if (z >= z_hi || nb >= 15) { zb[nb++] = z_hi; break; }
             zb[nb++] = z;
         }
+        const float a0 = M->c0 + lines[i].offset;
         for (int k = 0; k + 1 < nb; k++) {
             float z0 = zb[k], z1 = zb[k + 1];
             if (z1 - z0 < 0.05f) continue;
-            float x0 = cf[0] + cf[1] * z0 + cf[2] * z0 * z0;
-            float x1 = cf[0] + cf[1] * z1 + cf[2] * z1 * z1;
+            float x0 = a0 + M->h * z0 + M->c_shown * z0 * z0;
+            float x1 = a0 + M->h * z1 + M->c_shown * z1 * z1;
             float zm = 0.5f * (z0 + z1);
-            mm_road_seg(x0, z0, x1, z1, dashed, (zm >= zmin && zm <= zmax) ? col : fcol, p);
+            mm_road_seg(x0, z0, x1, z1, dashed, (zm >= M->zmin && zm <= M->zmax) ? col : fcol, p);
         }
     }
 }

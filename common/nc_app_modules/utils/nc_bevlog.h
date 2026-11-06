@@ -11,6 +11,9 @@
  *     bev_det.csv   worker thread, raw detections before the tracker
  *     bev_lane.csv  render thread, one row per new lane result (LDW)
  *     bev_frame.csv render thread, frame timing
+ *     bev_lanepts.csv render thread, one row per lane line per new lane result:
+ *                   the points the minimap gets (after the UFLD average), pts = u:v;u:v;...
+ *     bev_lanefit.csv render thread, one row per new lane result: minimap lane model
  * When disabled every call returns immediately.
  */
 
@@ -25,6 +28,8 @@ typedef enum {
     NC_BEVLOG_DET,
     NC_BEVLOG_LANE,
     NC_BEVLOG_FRAME,
+    NC_BEVLOG_LANEPTS,
+    NC_BEVLOG_LANEFIT,
     NC_BEVLOG_NUM
 } eNcBevLogFile;
 

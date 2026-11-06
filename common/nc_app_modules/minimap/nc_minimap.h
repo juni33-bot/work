@@ -19,6 +19,9 @@
  *   nc_minimap_add_obj(ch, &obj);            // for each vehicle bbox
  *   nc_minimap_draw(ch, viewport, &res);     // after the camera overlays
  *
+ * Lanes: one centre curve from the two ego lines, lines at fixed offsets from it,
+ * so the lane width is constant. Gentle curves are drawn straight (see nc_minimap.c).
+ *
  * Forward distance depends on NC_LDW_DEFAULT_FOCAL_PX / LDW_FOCAL_PX (see nc_ldw.h).
  */
 

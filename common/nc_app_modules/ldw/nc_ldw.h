@@ -216,11 +216,18 @@ int nc_ldw_is_in_ego_lane(uint32_t ch, float x, float y);
  * nc_ldw_app_get_lanes(): copy of the newest lane points (canvas px, with the
  *   network lane_class 0 none / 1 solid / 2 dashed) and their capture time.
  *   Returns -1 if none.
+ *
+ * k_inst / vp_inst: same geometry from this frame's two ego lines only (no EMA).
+ * Lanes stay exactly lane_width_m apart with it. 0 unless both lines were measured.
  */
 typedef struct {
     uint64_t t_us;
     float    k;
     float    vp_y;
+    float    k_inst;
+    float    vp_inst;
+    int      left_ok;           // left ego line measured in this frame
+    int      right_ok;          // right ego line measured in this frame
 } stNcLdwGeom;
 
 typedef struct {

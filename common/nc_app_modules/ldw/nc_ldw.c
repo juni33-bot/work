@@ -487,6 +487,15 @@ static void ldw_publish_geom(uint32_t ch, const stNcLdwContext *ctx, const pp_re
     g.k = ctx->calib_k;
     g.vp_y = ctx->calib_vp_y;                 // calibrated (slow EMA) horizon
 
+    /* no line fitted this time -> res still holds the previous result */
+    const stNcLdwResult *r = &ctx->res;
+    int fresh = r->valid && r->data_time_us == lane_buf->time_stamp;
+    g.left_ok  = fresh && r->left_detected;
+    g.right_ok = fresh && r->right_detected;
+    g.k_inst   = (g.left_ok && g.right_ok) ? r->right_a - r->left_a : 0.0f;
+    g.vp_inst  = g.k_inst > 1e-4f ? (r->left_b - r->right_b) / g.k_inst : 0.0f;
+    if (g.k_inst <= 1e-4f) g.k_inst = 0.0f;
+
     int n = lane_buf->lane_draw_info.max_lane_num;
     if (n > MAX_LANE_DET_CNT) n = MAX_LANE_DET_CNT;
     if (n < 0) n = 0;
