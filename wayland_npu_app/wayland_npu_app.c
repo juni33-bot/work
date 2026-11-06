@@ -518,6 +518,10 @@ int v4l2_initialize(void)
 // Written and read only in the render thread.
 static uint64_t g_disp_frame_ts_us[VIDEO_MAX_CH];
 
+// 1: draw the prediction line + end marker on the video. The minimap arrow and the cut-in
+// judgement do not depend on this: they use the future center, which is always computed.
+#define SHOW_PRED_LINE      (0)
+
 // prediction line shorter than this (screen px) is not drawn
 #define PRED_LINE_MIN_PX    (15.0f)
 
@@ -604,6 +608,7 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                                              obj_info.bbox.w - 6.f, obj_info.bbox.h - 6.f, dcolor, g_npu_prog);
                 }
 
+#if SHOW_PRED_LINE
                 // prediction line: current (predicted-now) center -> center after FUTURE_MS, dashed
                 // Hidden when shorter than PRED_LINE_MIN_PX: cars followed at similar speed barely
                 // move on screen, and their short line only shows bbox jitter.
@@ -614,6 +619,7 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                     nc_opengl_draw_line(cur_cx, cur_cy, fut_cx, fut_cy, 2 /* dashed */, dcolor, g_npu_prog);
                     nc_opengl_draw_rectangle(fut_cx - 4.f, fut_cy - 4.f, 8.f, 8.f, dcolor, g_npu_prog); // end marker
                 }
+#endif
 
                 // draw bbox label
 #ifdef USE_BYTETRACK
