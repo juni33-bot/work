@@ -54,6 +54,25 @@
  * 0: draw every lane line dashed */
 #define NC_MINIMAP_USE_LANE_CLASS (1)
 
+/* Predicted trajectory: arrow from the front edge of a vehicle to where that edge
+ * is after NC_TRAJ_FUTURE_MS_DEFAULT (0.5 s). Only the nearest vehicle of each lane
+ * has one. The prediction is relative to the ego vehicle and the ego speed is not
+ * known here, so only its lateral part is used: the arrow always points forward,
+ * FWD_M long, and leans by the predicted lateral motion. Its length does not show speed.
+ * PRED_CUTIN_COLOR for a cut-in vehicle (its box is yellow), PRED_COLOR otherwise.
+ * Predictions longer than MAX_M (bad velocity) are not drawn.
+ * LANE_HYST: lane fraction past the boundary before a vehicle changes lane.
+ * Sizes in canvas px. 0: off. */
+#define NC_MINIMAP_SHOW_PRED         (1)
+#define NC_MINIMAP_PRED_FWD_M        (3.0f)
+#define NC_MINIMAP_PRED_MAX_M        (15.0f)
+#define NC_MINIMAP_PRED_LANE_HYST    (0.1f)
+#define NC_MINIMAP_PRED_BODY_W       (5.0f)
+#define NC_MINIMAP_PRED_HEAD_LEN     (15.0f)
+#define NC_MINIMAP_PRED_OUTLINE_PX   (1.5f)
+#define NC_MINIMAP_PRED_COLOR        {0.45f, 0.95f, 0.85f, 1.0f}
+#define NC_MINIMAP_PRED_CUTIN_COLOR  {1.0f, 0.40f, 0.05f, 1.0f}
+
 /* panel position / size in canvas px (1920 x 1080, y grows downward) */
 #define NC_MINIMAP_PANEL_X      (20.0f)
 #define NC_MINIMAP_PANEL_Y      (140.0f)
@@ -77,6 +96,8 @@ typedef struct {
     uint64_t    t_disp_us;      // capture time of the displayed video frame
     float       color[4];       // RGBA of the box on the camera view (class colour)
     int         highlight;      // 1 = cut-in (drawn yellow)
+    int         fut_valid;      // 1: fut_u/fut_v hold the predicted bottom-centre
+    float       fut_u, fut_v;   // bottom-centre after NC_TRAJ_FUTURE_MS_DEFAULT (canvas px)
 } stNcMinimapObj;
 
 /* Start a new detection list for channel ch (keeps the old list if not called). */

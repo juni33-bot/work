@@ -633,6 +633,10 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
                     mo.t_disp_us  = g_disp_frame_ts_us[cut_ch];
                     memcpy(mo.color, dcolor, sizeof(mo.color));
                     mo.highlight  = is_cutin;
+                    // predicted bottom-centre after NC_TRAJ_FUTURE_MS_DEFAULT (box size kept)
+                    mo.fut_valid  = has_future;
+                    mo.fut_u      = fut_cx;
+                    mo.fut_v      = fut_cy + obj_info.bbox.h * 0.5f;
                     nc_minimap_add_obj((uint32_t)cut_ch, &mo);
                 }
 #endif
