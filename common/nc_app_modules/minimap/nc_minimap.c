@@ -37,22 +37,28 @@
  * is out of view and the box bottom moves to the front wheels, so z stalls and x bends
  * inwards (0001: about 1 s at z = 2.2). The measurement is dropped there and the vehicle
  * goes on with the closing speed and x from before the edge, faded out, drawn dashed.
+ * A long vehicle in the next lane fills the view before it reaches the edge: its bottom
+ * goes behind the dashboard and z runs away (0003: bus, z 4 -> 18 at the end), so a tall
+ * box beside the ego lane counts as well. Never in the ego lane: that is a vehicle ahead.
  * Only for vehicles closing slower than V_MAX (faster ones are crossing or oncoming)
  * and with an x that moved less than X_MAX. Speeds in minimap z units per second. */
-#define MM_COAST_HIST       (64)        // position history per track (1.5 s at up to 40 fps)
+#define MM_COAST_HIST       (96)        // position history per track (2.5 s at up to 38 fps)
 #define MM_COAST_EDGE_PX    (20.0f)     // box this close to the image side: touching
-#define MM_COAST_CANCEL_PX  (60.0f)     // box this far inside again: measured position is back
+#define MM_COAST_TALL_PX    (500.0f)    // box this tall counts as touching
+#define MM_COAST_TALL_X_M   (2.0f)      // ... when at least this far from the ego lane centre
+#define MM_COAST_CANCEL_PX  (60.0f)     // box this far inside again and
+#define MM_COAST_CANCEL_H_PX (400.0f)   // lower than this: measured position is back
 #define MM_COAST_MAX_Z_M    (12.0f)     // farther vehicles at the edge are not passing
 #define MM_COAST_V_MIN      (0.5f)
 #define MM_COAST_V_MAX      (6.0f)
 #define MM_COAST_X_MAX_M    (1.5f)
 #define MM_COAST_V_NEW_S    (0.2f)      // speed from samples aged V_NEW..V_OLD (newest are bent)
-#define MM_COAST_V_OLD_S    (1.3f)
+#define MM_COAST_V_OLD_S    (2.5f)      // long: boxes of near vehicles shake by about 1 m
 #define MM_COAST_V_MIN_PTS  (8)
 #define MM_COAST_X_NEW_S    (0.5f)      // x from samples aged X_NEW..X_OLD
 #define MM_COAST_X_OLD_S    (1.5f)
 #define MM_COAST_X_BLEND_S  (0.3f)      // edge x -> x from before the edge
-#define MM_COAST_MAX_S      (4.0f)
+#define MM_COAST_MAX_S      (5.0f)      // 0003: a bus takes about 4.9 s to pass
 #define MM_COAST_FADE_S     (1.2f)      // fade over the last part of MAX_S
 #define MM_COAST_FADE_Z_M   (3.0f)      // fade over the last part of the panel
 #define MM_COAST_FILL_ALPHA (0.22f)
@@ -317,7 +323,8 @@ static void mm_smooth(stMmTrack *t, const stMmObs *o, uint64_t now)
     int restart = (t->n_upd == 0 || now < t->last_upd_disp_us || now - t->last_upd_disp_us > MM_TRACK_GAP_US);
 
     // back inside the image: the measurement is good again
-    if (t->coast != MM_COAST_NONE && !mm_at_side(&o->in.meas, MM_COAST_CANCEL_PX)) {
+    if (t->coast != MM_COAST_NONE && !mm_at_side(&o->in.meas, MM_COAST_CANCEL_PX) &&
+        o->in.meas.h < MM_COAST_CANCEL_H_PX) {
         t->coast = MM_COAST_NONE;
         restart = 1;
     }
@@ -345,7 +352,9 @@ static void mm_smooth(stMmTrack *t, const stMmObs *o, uint64_t now)
             t->n_upd++;
         }
 #if NC_MINIMAP_COAST
-        if (t->in_range && o->zm < MM_COAST_MAX_Z_M && mm_at_side(&o->in.meas, MM_COAST_EDGE_PX))
+        if (t->in_range && o->zm < MM_COAST_MAX_Z_M &&
+            (mm_at_side(&o->in.meas, MM_COAST_EDGE_PX) ||
+             (o->in.meas.h >= MM_COAST_TALL_PX && fabsf(t->x) >= MM_COAST_TALL_X_M)))
             mm_coast_try(t, now);
 #endif
     }
